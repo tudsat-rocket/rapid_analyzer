@@ -8,7 +8,7 @@ use egui_tiles::{Tile, TileId};
 use crate::colors::color_for_index;
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
-use crate::panes::{AudioPlayerSlot, Pane, TreeBehavior};
+use crate::panes::{AudioPlayerSlot, Pane, PlotId, Plots, TreeBehavior};
 use crate::timeline::{self, Timeline};
 use crate::video_worker::VideoWorker;
 
@@ -17,13 +17,19 @@ struct ImportOutcome {
     result: Result<(String, SourceKind), String>,
 }
 
+/// Sidebar interactions can't touch the pane tree while it is being iterated
+/// over, so they're queued up and applied afterwards.
 enum PendingAction {
-    Add(Pane),
-    Remove(Pane),
+    AddPane(Pane),
+    RemovePane(Pane),
+    NewPlot(SourceId, String),
+    AddToPlot(PlotId, SourceId, String),
+    HideSeries(SourceId, String),
 }
 
 pub struct App {
     project: Project,
+    plots: Plots,
     tree: egui_tiles::Tree<Pane>,
     pane_tiles: HashMap<Pane, TileId>,
     timeline: Timeline,
@@ -43,6 +49,7 @@ impl App {
         let (import_tx, import_rx) = channel();
         let mut app = Self {
             project: Project::new(),
+            plots: Plots::default(),
             tree: egui_tiles::Tree::empty("root"),
             pane_tiles: HashMap::new(),
             timeline: Timeline::new((0.0, 1.0)),
@@ -153,16 +160,39 @@ impl App {
             }
             self.tree.tiles.remove(tile_id);
         }
+        if let Pane::Plot(id) = pane {
+            self.plots.close(*id);
+        }
+    }
+
+    fn apply(&mut self, action: PendingAction) {
+        match action {
+            PendingAction::AddPane(pane) => self.add_pane(pane),
+            PendingAction::RemovePane(pane) => self.remove_pane(&pane),
+            PendingAction::NewPlot(source, series) => {
+                let id = self.plots.create(source, series);
+                self.add_pane(Pane::Plot(id));
+            }
+            PendingAction::AddToPlot(plot, source, series) => {
+                self.plots.add(plot, source, series);
+                // The plot may exist without a pane if its tab was closed.
+                self.add_pane(Pane::Plot(plot));
+            }
+            PendingAction::HideSeries(source, series) => {
+                for id in self.plots.remove_series(source, &series) {
+                    self.remove_pane(&Pane::Plot(id));
+                }
+            }
+        }
     }
 
     fn source_browser(&mut self, ui: &mut egui::Ui) {
         ui.heading("rapid-analyzer");
         ui.horizontal(|ui| {
-            if ui.button("+ Import file...").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
+            if ui.button("+ Import file...").clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_file() {
                     self.start_import(path);
                 }
-            }
             if self.importing > 0 {
                 ui.spinner();
             }
@@ -183,6 +213,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Filter series");
             ui.text_edit_singleline(&mut self.series_filter);
+            if !self.series_filter.is_empty() && ui.small_button("✖").clicked() {
+                self.series_filter.clear();
+            }
         });
         ui.separator();
 
@@ -192,6 +225,7 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             let sources = &mut self.project.sources;
             let pane_tiles = &self.pane_tiles;
+            let plots = &self.plots;
             for source in sources.iter_mut() {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut source.enabled, "");
@@ -230,23 +264,7 @@ impl App {
                             .id_salt(source.id)
                             .default_open(log.series.len() <= 12)
                             .show(ui, |ui| {
-                                for series in &log.series {
-                                    if !filter.is_empty() && !series.name.to_lowercase().contains(&filter) {
-                                        continue;
-                                    }
-                                    let pane = Pane::Plot {
-                                        source: source.id,
-                                        series: series.name.clone(),
-                                    };
-                                    let mut shown = pane_tiles.contains_key(&pane);
-                                    if ui.checkbox(&mut shown, &series.name).changed() {
-                                        pending.push(if shown {
-                                            PendingAction::Add(pane)
-                                        } else {
-                                            PendingAction::Remove(pane)
-                                        });
-                                    }
-                                }
+                                series_browser(ui, source.id, &log.series, plots, &filter, &mut pending);
                             });
                     }
                     SourceKind::Video(v) => {
@@ -256,14 +274,14 @@ impl App {
                             .checkbox(&mut shown, format!("video panel ({:.1}s, {}x{} @{:.0}fps)", v.duration, v.width, v.height, v.fps))
                             .changed()
                         {
-                            pending.push(if shown { PendingAction::Add(pane) } else { PendingAction::Remove(pane) });
+                            pending.push(if shown { PendingAction::AddPane(pane) } else { PendingAction::RemovePane(pane) });
                         }
                     }
                     SourceKind::Audio(a) => {
                         let pane = Pane::Audio(source.id);
                         let mut shown = pane_tiles.contains_key(&pane);
                         if ui.checkbox(&mut shown, format!("audio panel ({:.1}s)", a.duration)).changed() {
-                            pending.push(if shown { PendingAction::Add(pane) } else { PendingAction::Remove(pane) });
+                            pending.push(if shown { PendingAction::AddPane(pane) } else { PendingAction::RemovePane(pane) });
                         }
                     }
                 }
@@ -272,12 +290,124 @@ impl App {
         });
 
         for action in pending {
-            match action {
-                PendingAction::Add(p) => self.add_pane(p),
-                PendingAction::Remove(p) => self.remove_pane(&p),
-            }
+            self.apply(action);
         }
     }
+}
+
+/// The series list for one log source, grouped by message so a few hundred
+/// tlog fields stay navigable.
+fn series_browser(
+    ui: &mut egui::Ui,
+    source: SourceId,
+    series: &[crate::series::TimeSeries],
+    plots: &Plots,
+    filter: &str,
+    pending: &mut Vec<PendingAction>,
+) {
+    let matching: Vec<&crate::series::TimeSeries> = series
+        .iter()
+        .filter(|s| filter.is_empty() || s.name.to_lowercase().contains(filter))
+        .collect();
+    if matching.is_empty() {
+        ui.weak("no matching series");
+        return;
+    }
+
+    // The list arrives sorted by name, so each message's fields are already
+    // a contiguous run -- no grouping pass needed, just a look at where the
+    // prefix changes.
+    let mut i = 0;
+    while i < matching.len() {
+        let group = group_of(&matching[i].name);
+        let end = matching[i..]
+            .iter()
+            .position(|s| group_of(&s.name) != group)
+            .map_or(matching.len(), |n| i + n);
+
+        match group {
+            // Series without a message prefix (a sqlite sensor log) have
+            // nothing to group by; list them directly.
+            None => {
+                for s in &matching[i..end] {
+                    series_row(ui, source, s, &s.name, plots, pending);
+                }
+            }
+            Some(name) => {
+                egui::CollapsingHeader::new(format!("{name}  ({})", end - i))
+                    .id_salt((source, name))
+                    // Searching means the user is already looking at a short
+                    // list and wants to see it.
+                    .default_open(!filter.is_empty())
+                    .show(ui, |ui| {
+                        for s in &matching[i..end] {
+                            let label = s.name.strip_prefix(name).and_then(|r| r.strip_prefix('.')).unwrap_or(&s.name);
+                            series_row(ui, source, s, label, plots, pending);
+                        }
+                    });
+            }
+        }
+        i = end;
+    }
+}
+
+fn series_row(
+    ui: &mut egui::Ui,
+    source: SourceId,
+    series: &crate::series::TimeSeries,
+    label: &str,
+    plots: &Plots,
+    pending: &mut Vec<PendingAction>,
+) {
+    ui.horizontal(|ui| {
+        let mut shown = plots.shows(source, &series.name);
+        let text = match &series.unit {
+            Some(unit) => format!("{label}  [{unit}]"),
+            None => label.to_string(),
+        };
+        if ui
+            .checkbox(&mut shown, text)
+            .on_hover_text(format!("{} ({} samples)", series.name, series.len()))
+            .changed()
+        {
+            pending.push(if shown {
+                PendingAction::NewPlot(source, series.name.clone())
+            } else {
+                PendingAction::HideSeries(source, series.name.clone())
+            });
+        }
+
+        // Adding to an *existing* graph is what makes two series comparable,
+        // so it lives in the list next to the checkbox rather than buried in
+        // the graph itself.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button("➕", |ui| {
+                ui.set_min_width(220.0);
+                if ui.button("New plot").clicked() {
+                    pending.push(PendingAction::NewPlot(source, series.name.clone()));
+                    ui.close();
+                }
+                let targets: Vec<_> = plots.iter().filter(|p| !p.contains(source, &series.name)).collect();
+                if !targets.is_empty() {
+                    ui.separator();
+                    ui.weak("Add to");
+                    for plot in targets {
+                        if ui.button(plot.title()).clicked() {
+                            pending.push(PendingAction::AddToPlot(plot.id, source, series.name.clone()));
+                            ui.close();
+                        }
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Plot this together with another series");
+        });
+    });
+}
+
+/// `"PRESSURE_VESSEL[1].pressure1"` -> `Some("PRESSURE_VESSEL[1]")`.
+fn group_of(name: &str) -> Option<&str> {
+    name.rfind('.').map(|dot| &name[..dot])
 }
 
 impl eframe::App for App {
@@ -301,20 +431,31 @@ impl eframe::App for App {
             timeline::show(ui, &mut self.timeline, self.project.time_bounds());
         });
 
+        let mut closed = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
             if self.tree.tiles.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("Import data and check series/panels in the left sidebar to display them here.\nDrag tabs to rearrange; drop on an edge to split.");
+                    ui.weak(
+                        "Import data and tick series/panels in the left sidebar to display them here.\n\
+                         Use ➕ next to a series to draw it in an existing plot.\n\
+                         Drag tabs to rearrange; drop on an edge to split.",
+                    );
                 });
                 return;
             }
             let mut behavior = TreeBehavior {
                 project: &mut self.project,
+                plots: &mut self.plots,
                 timeline: &mut self.timeline,
                 video_workers: &mut self.video_workers,
                 audio_players: &mut self.audio_players,
+                closed: Vec::new(),
             };
             self.tree.ui(&mut behavior, ui);
+            closed = behavior.closed;
         });
+        for pane in closed {
+            self.remove_pane(&pane);
+        }
     }
 }

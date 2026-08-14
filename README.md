@@ -13,19 +13,37 @@ zoomed together.
   generically, no per-message hardcoding), a
   `sensor_data(timestamp, sensor_name, value)` SQLite log, and video/audio
   files (via `ffmpeg`/`ffprobe`).
+- **One series per instance**: messages that carry an `instance` field
+  describe a different thing on every send -- each of the six
+  `PRESSURE_VESSEL`s and nine `VALVE`s in a log gets its own
+  `PRESSURE_VESSEL[1].pressure1` / `VALVE[MAIN].state` series rather than
+  all of them being interleaved into one line. Units come from the dialect
+  (and centidegrees etc. are scaled to the unit they name), and MAVLink's
+  "no reading" sentinels are dropped instead of drawn as spikes.
+- **Multi-series graphs**: any number of series share one graph, so a tank's
+  pressure and temperature can be read against each other. Tick a series to
+  open it in its own graph, or use ➕ next to it to add it to an existing
+  one; each graph has a title (auto-generated from its contents, editable)
+  and an optional 0..1 normalization for series whose scales differ.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
   any graph, adjustable playback speed.
 - **Per-source offset**: every source has its own UTC start time (from log
-  timestamps, or container `creation_time` metadata / file mtime for
-  media); drag its `offset` field to correct clock drift between sources.
+  timestamps, or -- for media -- container `creation_time` metadata, else a
+  timestamp parsed out of the file name, else the file's mtime); drag its
+  `offset` field to correct clock drift between sources.
 - **Linked graphs**: panning/zooming any log or waveform plot updates the
   shared time window everywhere -- other graphs, the video frame, and the
   audio playhead all follow.
 - **Rearrangeable layout**: pick which series/panels to show from the
-  sidebar; drag tabs to reorder, drop on an edge to split (via `egui_tiles`).
+  sidebar, where a log's series are grouped by message; drag tabs to
+  reorder, drop on an edge to split, close a tab to drop the pane (via
+  `egui_tiles`).
 - **Performance**: each time series is indexed with a min/max mipmap at
   import time, so plots only ever draw a couple thousand points regardless
-  of zoom level or file size. See `examples/bench_import.rs`.
+  of zoom level or file size. See `examples/bench_import.rs` (`--list`
+  prints every imported series with its sample count, span and unit).
+  Video is decoded by a long-running `ffmpeg` that streams downscaled
+  frames, re-seeking only when the playhead jumps.
 
 ## Building
 
@@ -111,10 +129,20 @@ changes.
   start time; if that guess is wrong (no container metadata), the source
   browser shows a warning -- fix it with the offset field.
 - MAVLink field extraction is generic: every message is serialized to JSON
-  and every numeric field becomes a `MSG_NAME.field` series. Fixed-size
-  byte/char array fields (e.g. text fields) get pulled in too since they're
-  numeric arrays under the hood; they're harmless, just not meaningful to
-  plot.
+  and every field becomes a `MSG_NAME.field` series -- numbers directly,
+  enums and bitmasks by resolving their entry names back to the numbers
+  they stand for. Fixed-size byte/char array fields (e.g. text fields) get
+  pulled in too since they're numeric arrays under the hood; they're
+  harmless, just not meaningful to plot.
+- Series names carry whatever it takes to keep them apart:
+  `MSG[instance].field` for messages with an `instance` field, and
+  `MSG@sys:comp.field` when more than one system on the link sends the same
+  message (a log where both the vehicle and the ground station send
+  `HEARTBEAT`, say).
+- The schema behind all of that -- instance fields, units, enums, `invalid`
+  sentinels -- is re-read from the dialect XML by `build.rs` into static
+  tables (`src/mavlink_meta.rs`), since `mavlink-bindgen` only emits the
+  message structs. Adding a message to the XML is still all it takes.
 
 ## Known limitations
 
@@ -127,9 +155,17 @@ changes.
 - `.tlog` parsing stops if the file is truncated mid-frame; a bad/unknown
   message elsewhere in the stream is skipped via mavlink-core's own
   CRC-based resync and doesn't stop the import.
-- The generic field extraction (see "Data model notes") only pulls out
-  numeric/boolean fields; MAVLink enum and bitmask fields (e.g. a
-  `PRESSURE_VESSEL`'s `fluid` type or status `flags`, or a `HEARTBEAT`'s
-  flight mode) serialize to strings and are currently dropped rather than
-  plotted. A message whose fields are *all* enums (e.g. `ROCKET_INFO`)
-  won't produce any series at all.
+- Enum and bitmask fields are plotted as their raw numeric value; the axis
+  shows `2`, not `NITROGEN`. Bitmasks are plotted as the combined value
+  rather than one line per bit.
+- "No reading" filtering keeps to the unambiguous MAVLink sentinels: an
+  explicit `invalid="NaN"`/`invalid="*_MAX"`, or a unit-carrying integer
+  field sitting at its type's maximum. `invalid="0"` and `invalid="-1"` are
+  left alone, since those are values a sensor can genuinely report.
+- A media file with no container `creation_time` and no timestamp in its
+  name still falls back to the file's mtime, which is usually wrong; the
+  source browser says where the guess came from, and the offset field
+  corrects it.
+- Raw `CAN_FRAME` payloads are imported as bytes (`CAN_FRAME.data[0..7]`)
+  and not split per CAN id or decoded into ADC channels -- that mapping is
+  vehicle-specific and lives outside the dialect.

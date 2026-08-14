@@ -21,7 +21,7 @@ impl AudioPlayback {
     pub fn new(path: &Path) -> Result<Self> {
         let device = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|e| anyhow::anyhow!("no audio output device available: {e}"))?;
-        let player = Player::connect_new(&device.mixer());
+        let player = Player::connect_new(device.mixer());
 
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let byte_len = file.metadata().map(|m| m.len()).ok();

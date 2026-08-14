@@ -29,6 +29,21 @@ fn main() {
         .sum();
     println!("series with data: {total_points}");
 
+    // `--list` prints what the source browser would show, which is the quick
+    // way to check that instance fields, units and enums came through.
+    if std::env::args().any(|a| a == "--list") {
+        for s in &log.series {
+            let span = s.time_bounds().map_or(0.0, |(a, b)| b - a);
+            println!(
+                "  {:50} {:>9} pts  {:>9.1}s  {}",
+                s.name,
+                s.len(),
+                span,
+                s.unit.as_deref().unwrap_or("")
+            );
+        }
+    }
+
     let Some((lo, hi)) = log
         .series
         .iter()

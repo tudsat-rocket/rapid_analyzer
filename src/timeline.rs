@@ -30,12 +30,11 @@ impl Timeline {
             return;
         }
         self.cursor += dt_seconds * self.speed as f64;
-        if let Some((_, hi)) = bounds {
-            if self.cursor >= hi {
+        if let Some((_, hi)) = bounds
+            && self.cursor >= hi {
                 self.cursor = hi;
                 self.playing = false;
             }
-        }
     }
 
     pub fn seek(&mut self, t: f64, bounds: Option<(f64, f64)>) {
@@ -52,6 +51,49 @@ pub fn format_utc(t: f64) -> String {
     match chrono::DateTime::from_timestamp(t.floor() as i64, 0) {
         Some(dt) => format!("{}.{:03}Z", dt.format("%Y-%m-%d %H:%M:%S"), ((t.fract()) * 1000.0) as u32),
         None => format!("{t:.3}"),
+    }
+}
+
+/// Grid steps a clock actually uses. egui_plot's default spacer subdivides by
+/// powers of ten, which on a time axis puts lines at 100- and 1000-second
+/// intervals -- numbers nobody reads a clock in, and coarse enough that a
+/// ten-minute window ends up with a single labelled tick.
+const TIME_STEPS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, // sub-second
+    1.0, 2.0, 5.0, 10.0, 15.0, 30.0, // seconds
+    60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, // minutes
+    3600.0, 7200.0, 10800.0, 21600.0, 43200.0, 86400.0, // hours and up
+];
+
+/// Grid line spacing for a time axis: the three step sizes egui_plot draws at
+/// different thicknesses, chosen off the clock ladder above.
+pub fn time_grid_steps(input: egui_plot::GridInput) -> [f64; 3] {
+    let last = TIME_STEPS.len() - 1;
+    let finest = TIME_STEPS
+        .iter()
+        .position(|s| *s >= input.base_step_size)
+        .unwrap_or(last);
+    [
+        TIME_STEPS[finest],
+        TIME_STEPS[(finest + 2).min(last)],
+        TIME_STEPS[(finest + 4).min(last)],
+    ]
+}
+
+/// Tick label for a plot's time axis. The axis carries absolute UTC seconds,
+/// which as a raw number (1.786e9) says nothing; what a reader wants is the
+/// clock time, at whatever precision the current zoom level resolves.
+pub fn format_axis_time(t: f64, step_size: f64) -> String {
+    let Some(dt) = chrono::DateTime::from_timestamp(t.floor() as i64, 0) else {
+        return format!("{t:.3}");
+    };
+    if step_size >= 3600.0 {
+        dt.format("%H:%M").to_string()
+    } else if step_size >= 1.0 {
+        dt.format("%H:%M:%S").to_string()
+    } else {
+        let millis = (t.rem_euclid(1.0) * 1000.0).round() as u32;
+        format!("{}.{:03}", dt.format("%H:%M:%S"), millis)
     }
 }
 
@@ -75,12 +117,11 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
 
     ui.horizontal(|ui| {
         let play_label = if timeline.playing { "⏸" } else { "▶" };
-        if ui.button("⏮").on_hover_text("Jump to start").clicked() {
-            if let Some((lo, _)) = project_bounds {
+        if ui.button("⏮").on_hover_text("Jump to start").clicked()
+            && let Some((lo, _)) = project_bounds {
                 timeline.seek(lo, project_bounds);
                 changed = true;
             }
-        }
         if ui.button("◀").on_hover_text("Step back 1s").clicked() {
             timeline.step(-1.0, project_bounds);
             changed = true;
@@ -92,12 +133,11 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
             timeline.step(1.0, project_bounds);
             changed = true;
         }
-        if ui.button("⏭").on_hover_text("Jump to end").clicked() {
-            if let Some((_, hi)) = project_bounds {
+        if ui.button("⏭").on_hover_text("Jump to end").clicked()
+            && let Some((_, hi)) = project_bounds {
                 timeline.seek(hi, project_bounds);
                 changed = true;
             }
-        }
 
         ui.separator();
         ui.label("Speed");
@@ -149,14 +189,13 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
         Stroke::new(2.0, Color32::from_rgb(0xFF, 0x5C, 0x3D)),
     );
 
-    if response.clicked() || response.dragged() {
-        if let Some(pos) = response.interact_pointer_pos() {
+    if (response.clicked() || response.dragged())
+        && let Some(pos) = response.interact_pointer_pos() {
             let frac = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
             timeline.seek(lo + frac as f64 * (hi - lo), project_bounds);
             timeline.playing = false;
             changed = true;
         }
-    }
 
     changed
 }

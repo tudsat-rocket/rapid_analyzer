@@ -3,6 +3,7 @@ pub mod audio_playback;
 pub mod colors;
 pub mod dialect;
 pub mod import;
+pub mod mavlink_meta;
 pub mod model;
 pub mod panes;
 pub mod series;

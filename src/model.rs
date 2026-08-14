@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use egui::Color32;
 
+use crate::import::start_time::StartTimeSource;
 use crate::series::TimeSeries;
 
 pub type SourceId = u64;
@@ -123,15 +124,15 @@ pub struct VideoSource {
     pub fps: f64,
     pub width: u32,
     pub height: u32,
-    /// Best-guess UTC time of the first frame (container metadata or file mtime).
+    /// Best-guess UTC time of the first frame.
     pub start_utc: f64,
-    pub start_utc_is_guess: bool,
+    pub start_utc_source: StartTimeSource,
 }
 
 pub struct AudioSource {
     pub duration: f64,
     pub start_utc: f64,
-    pub start_utc_is_guess: bool,
+    pub start_utc_source: StartTimeSource,
     /// Min/max envelope for waveform display, evenly spaced across `duration`.
     pub waveform_peaks: Vec<[f32; 2]>,
 }

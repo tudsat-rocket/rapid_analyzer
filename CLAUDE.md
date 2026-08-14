@@ -17,7 +17,8 @@ cargo run --release -- log.tlog telemetry.sqlite video.mp4   # files are optiona
 cargo test
 cargo test slice_matches_raw_when_small        # single test (unit tests live in src/series.rs)
 cargo clippy --all-targets
-cargo run --release --example bench_import -- <large.tlog>   # import + LOD query timings
+cargo run --release --example bench_import -- <large.tlog>          # import + LOD query timings
+cargo run --release --example bench_import -- <large.tlog> --list   # every series: samples, span, unit
 ```
 
 System prerequisites: `pkg-config`, `libasound2-dev` (ALSA, for `rodio`), and `ffmpeg`/`ffprobe`
@@ -44,8 +45,10 @@ Everything hangs off two shared pieces of state, both owned by `App` (`src/app.r
 There is one master timeline in **absolute UTC seconds**, and each source converts into it:
 
 - Log sources store raw UTC timestamps already; their base is `0.0`.
-- Video/audio run on a 0-based local clock, so their base is `start_utc` (from container
-  `creation_time`, else file mtime — flagged by `start_utc_is_guess`).
+- Video/audio run on a 0-based local clock, so their base is `start_utc`, resolved by
+  `import/start_time.rs`: container `creation_time`, else a timestamp parsed out of the file
+  name (read as UTC), else file mtime. `start_utc_source` records which, so the UI can say how
+  much to trust it.
 
 `Source::to_local_time` / `to_master_time` (`src/model.rs`) are the only correct way to cross that
 boundary; `offset_seconds` is applied inside them. Anything that touches a plot's x-axis, a video
@@ -58,14 +61,19 @@ sniffing (SQLite magic, or a tlog's 8-byte timestamp followed by a MAVLink `0xFD
 Imports run on a spawned thread and come back to the UI over an `mpsc` channel (`App::poll_imports`).
 
 - `import/tlog.rs` — decodes against the generated `rapid` dialect and extracts fields
-  **generically**: each message is serialized to JSON and every numeric/bool field becomes a
-  `MSG_NAME.field` series. There is deliberately no per-message hardcoding; adding a message to
-  the dialect XML is enough to make it plottable. Consequence: enum/bitmask fields serialize to
-  strings and are dropped.
+  **generically**: each message is serialized to JSON and every field becomes a series. There is
+  deliberately no per-message hardcoding; adding a message to the dialect XML is enough to make
+  it plottable. Series are keyed by `(message, system, component, instance)`, which is what keeps
+  the six `PRESSURE_VESSEL`s and nine `VALVE`s in a log apart — see `src/mavlink_meta.rs`. The
+  resulting names are `MSG[instance].field`, with `@sys:comp` added only when a message arrives
+  from more than one sender. Enum fields (serialized as `{"type": "ENTRY"}`) and bitmasks
+  (`"A | B"`) are resolved back to numbers; values equal to a field's `invalid` sentinel are
+  dropped; `cdegC`-style units are scaled to the unit they name.
 - `import/sqlite_log.rs` — pivots long-form `sensor_data(timestamp, sensor_name, value)` rows into
   one series per `sensor_name`.
-- `import/video.rs`, `import/audio.rs` — shell out to `ffprobe` (metadata) and `ffmpeg` (single
-  frames as PNG; PCM for the waveform envelope). No decoder is linked in.
+- `import/video.rs`, `import/audio.rs` — shell out to `ffprobe` (metadata) and `ffmpeg` (a
+  streamed sequence of downscaled RGBA frames, see `FrameStream`; PCM for the waveform
+  envelope). No decoder is linked in.
 
 ### Performance model
 
@@ -76,26 +84,44 @@ the requested window, so a pane draws ~2000 points regardless of file size or zo
 rendering going through `slice_for_range` / `value_bounds_in_range`; never hand raw points to
 `egui_plot`. `examples/bench_import.rs` measures both import and per-frame query cost.
 
-Video decoding is off-thread (`src/video_worker.rs`): scrub requests are coalesced so only the
-latest position is decoded, and the resulting texture is updated in place rather than
-reallocated. Audio playback (`src/audio_playback.rs`) is a `rodio` player re-seeked whenever it
+Video decoding is off-thread (`src/video_worker.rs`) and *streaming*: one long-running `ffmpeg`
+(`video::FrameStream`) emits downscaled RGBA frames at a constant rate, so the frame after the
+current one costs a pipe read rather than a process spawn. Restarting it — a seek — costs ~0.3 s,
+so the worker decodes forward across small gaps and only re-seeks when the jump is big enough to
+be worth it; both costs are measured at run time (`Pacing`) because the trade-off depends
+entirely on the file. Scrub requests are coalesced so only the latest position is decoded, and
+the resulting texture is updated in place rather than reallocated.
+
+Audio playback (`src/audio_playback.rs`) is a `rodio` player re-seeked whenever it
 drifts >0.3 s from the timeline cursor; a missing output device is cached as `None` in
 `audio_players` so it isn't retried every frame.
 
 ### UI panes
 
-`egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot`, `Video`,
-`Audio`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
-checkboxes add/remove panes through it, so both must stay in sync (`add_pane`/`remove_pane`).
-Log series start hidden (a tlog can carry hundreds of fields); media panes are shown on import.
+`egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot(PlotId)`,
+`Video`, `Audio`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
+checkboxes and tab close buttons add/remove panes through it, so both must stay in sync
+(`add_pane`/`remove_pane`). Closures inside `tree.ui` can't reach `App`, so `TreeBehavior` collects
+panes to drop into `closed`, which `App` drains afterwards. Log series start hidden (a tlog can
+carry hundreds of fields); media panes are shown on import.
 
-Sidebar iteration borrows `self.project.sources` mutably, so pane add/remove is queued into a
+A `Plot` pane doesn't name a series — it names a `PlotSpec` in `App::plots` (`Plots`), which holds
+any number of `(source, series, colour)` entries plus a title and a normalize flag. That is what
+lets one graph carry pressure and temperature together. Ticking a series in the sidebar opens a
+new plot; the ➕ menu next to it adds the series to an existing one.
+
+Sidebar iteration borrows `self.project.sources` mutably, so every mutation is queued into a
 `PendingAction` vec and applied after the loop.
 
 ## MAVLink dialect
 
 `build.rs` runs `mavlink-bindgen` over `mavlink_dialects/` at build time; `src/dialect.rs`
-`include!`s the output. To add or change a project message, edit `mavlink_dialects/Rapid.xml`
+`include!`s the output. It then makes a **second pass** over the same XML (via `quick-xml`) for
+the schema the generator drops — `instance="true"`, `units`, `enum`, `invalid` — emitting static
+tables that `src/mavlink_meta.rs` includes. The importer needs those to name and scale series
+correctly, so a new field's XML attributes take effect without any Rust change.
+
+To add or change a project message, edit `mavlink_dialects/Rapid.xml`
 (currently `ROCKET_INFO`, `PRESSURE_VESSEL`, `VALVE` at ids 20000+) — cargo reruns `build.rs`
 automatically. The `dialect-rapid` and `serde` Cargo features gate the generated module and must
 stay enabled; `unexpected_cfgs = "allow"` in `Cargo.toml` exists because the generated code

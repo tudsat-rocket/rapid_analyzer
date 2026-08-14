@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
+use crate::import::start_time;
 use crate::model::AudioSource;
 
 /// Number of (min,max) buckets to generate for the waveform overview,
@@ -29,17 +30,14 @@ pub fn probe(path: &Path) -> Result<AudioSource> {
         .unwrap_or(0.0);
 
     let creation_time = json["format"]["tags"]["creation_time"].as_str();
-    let (start_utc, start_utc_is_guess) = match creation_time.and_then(super::video::parse_iso8601) {
-        Some(t) => (t, false),
-        None => (super::video::file_mtime_utc(path).unwrap_or(0.0), true),
-    };
+    let (start_utc, start_utc_source) = start_time::resolve(path, creation_time);
 
     let waveform_peaks = build_waveform(path, duration).unwrap_or_default();
 
     Ok(AudioSource {
         duration,
         start_utc,
-        start_utc_is_guess,
+        start_utc_source,
         waveform_peaks,
     })
 }

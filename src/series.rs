@@ -32,6 +32,21 @@ impl TimeSeries {
         }
     }
 
+    pub fn with_unit(mut self, unit: Option<String>) -> Self {
+        self.unit = unit;
+        self
+    }
+
+    /// Number of raw samples, for the "how much data is behind this line"
+    /// hint in the source browser.
+    pub fn len(&self) -> usize {
+        self.raw.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
+    }
+
     pub fn time_bounds(&self) -> Option<(f64, f64)> {
         if self.raw.is_empty() {
             None
@@ -186,7 +201,7 @@ mod tests {
         let ts = TimeSeries::from_points("big", pts);
         let sliced = ts.slice_for_range(0.0, 10_000.0, 0.0, 2000);
         assert!(sliced.len() < 20_000, "expected decimation, got {}", sliced.len());
-        assert!(sliced.len() > 0);
+        assert!(!sliced.is_empty());
     }
 
     #[test]

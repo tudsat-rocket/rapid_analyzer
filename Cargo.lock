@@ -3519,6 +3519,7 @@ dependencies = [
  "mavlink-core",
  "num-derive",
  "num-traits",
+ "quick-xml 0.39.4",
  "rfd",
  "rodio",
  "rusqlite",

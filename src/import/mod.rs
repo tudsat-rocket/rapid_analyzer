@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod sqlite_log;
+pub mod start_time;
 pub mod tlog;
 pub mod video;
 
@@ -12,7 +13,7 @@ use anyhow::{Result, bail};
 use crate::model::SourceKind;
 
 const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "m4v"];
-const AUDIO_EXTS: &[&str] = &["m4a", "mp3", "wav", "aac", "flac", "ogg"];
+const AUDIO_EXTS: &[&str] = &["m4a", "mp3", "wav", "aac", "flac", "ogg", "oga", "ogx", "opus", "wma"];
 
 /// Detect the format of `path` (by extension, falling back to content
 /// sniffing for extensionless files like the SQLite example log) and import

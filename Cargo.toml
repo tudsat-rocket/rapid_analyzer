@@ -26,6 +26,9 @@ serde_json = "1.0.151"
 
 [build-dependencies]
 mavlink-bindgen = "0.18.0"
+# Second pass over the dialect XML for the schema mavlink-bindgen drops
+# (units, instance fields, enums); same version the generator itself uses.
+quick-xml = "0.39"
 
 [features]
 default = ["dialect-rapid", "serde"]
