@@ -1,0 +1,163 @@
+<?xml version="1.0"?>
+<mavlink>
+    <!-- mavlink message ID range: 20000 - 20099, mavlink command ID range: 20000 - 20099 -->
+    <!-- Picked to stay clear of every dialect in mavlink/mavlink -->
+    <include>common.xml</include>
+    <version>0</version>
+    <dialect>0</dialect>
+    <enums>
+        <!-- Extension of MAV_CMD from common.xml -->
+        <enum name="MAV_CMD">
+            <entry value="20000" name="MAV_CMD_COMMAND_VALVE">
+                <description></description>
+                <param index="1" label="Valve" enum="VALVE_ID">Valve to command</param>
+                <param index="2" minValue="0" maxValue="1" label="Target Position">Target Valve Position (0 = fully closed, 1 = fully open)</param>
+                <param index="3">Empty</param>
+                <param index="4">Empty</param>
+                <param index="5">Empty</param>
+                <param index="6">Empty</param>
+                <param index="7">Empty</param>
+            </entry>
+        </enum>
+        <enum name="PRESSURE_VESSEL_FLAG" bitmask="true">
+            <description>Status flags for a PRESSURE_VESSEL.</description>
+            <entry name="PRESSURE_VESSEL_FLAG_HEALTHY" value="1">
+                <description>All sensors reporting nominal.</description>
+            </entry>
+            <entry name="PRESSURE_VESSEL_FLAG_OVERPRESSURE" value="2">
+                <description>At least one pressure reading exceeds rated_pressure.</description>
+            </entry>
+            <entry name="PRESSURE_VESSEL_FLAG_EXTERNAL" value="4">
+                <description>Vessel is an external/offboard (ground support) tank, not part of the flight vehicle.</description>
+            </entry>
+        </enum>
+        <enum name="FLUID_TYPE">
+            <description>TODO</description>
+            <entry name="UNKNOWN" value="0">
+                <description>Unknown or unspecified</description>
+            </entry>
+            <entry name="AIR" value="1">
+                <description>Compressed Air</description>
+            </entry>
+            <entry name="NITROGEN" value="2">
+                <description>Nitrogen</description>
+            </entry>
+            <entry name="HELIUM" value="3">
+                <description>Helium</description>
+            </entry>
+            <entry name="NITROUS_OXIDE" value="5">
+                <description>Nitrous Oxide</description>
+            </entry>
+            <entry name="LIQUID_OXYGEN" value="6">
+                <description>Liquid Oxygen</description>
+            </entry>
+            <entry name="ETHANOL" value="7">
+                <description>Ethanol</description>
+            </entry>
+            <entry name="COMBUSTION" value="255">
+                <description>Combustion, use when describing a combustion chamber using PRESSURE_VESSEL messages</description>
+            </entry>
+        </enum>
+        <enum name="PROPULSION_TYPE">
+            <description>Propulsion type advertised by VEHICLE_INFO.</description>
+            <entry name="PROPULSION_TYPE_SOLID" value="0">
+                <description>Conventional solid-fuel motor.</description>
+            </entry>
+            <entry name="PROPULSION_TYPE_HYBRID" value="1">
+                <description>Hybrid (e.g. N2O / paraffin) motor with valves and tanks.</description>
+            </entry>
+        </enum>
+        <enum name="ROCKET_CAPABILITY" bitmask="true">
+            <description>Capability bits for VEHICLE_INFO. Reserved for future use.</description>
+            <entry name="ROCKET_CAPABILITY_RESERVED" value="1">
+                <description>Reserved.</description>
+            </entry>
+        </enum>
+        <enum name="VALVE_ID">
+            <description>Identifies a specific valve on a hybrid rocket.</description>
+            <entry name="VALVE_ID_PRESSURANT_VENT" value="0">
+                <description>Post-regulator pressurant vent.</description>
+            </entry>
+            <entry name="VALVE_ID_PRESSURIZATION" value="1">
+                <description>Pressurant tank to oxidizer tank.</description>
+            </entry>
+            <entry name="VALVE_ID_OXIDIZER_VENT" value="2">
+                <description>Top of oxidizer tank.</description>
+            </entry>
+            <entry name="VALVE_ID_OXIDIZER_FILL" value="3">
+                <description>Bottom of oxidizer tank, ground fill connection.</description>
+            </entry>
+            <entry name="VALVE_ID_MAIN" value="4">
+                <description>Oxidizer tank to combustion chamber.</description>
+            </entry>
+            <entry name="VALVE_ID_EXTERNAL_PRESSURANT_FILL" value="5">
+                <description>External pressurant filling line on pad, to rocket.</description>
+            </entry>
+            <entry name="VALVE_ID_EXTERNAL_OXIDIZER_FILL" value="6">
+                <description>External oxidizer filling line on pad, to rocket.</description>
+            </entry>
+            <entry name="VALVE_ID_EXTERNAL_PRESSURANT_VENT" value="7">
+                <description>Reserved: external pressurant tank vent.</description>
+            </entry>
+            <entry name="VALVE_ID_EXTERNAL_OXIDIZER_VENT" value="8">
+                <description>Reserved: external oxidizer tank vent.</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_1" value="245">
+                <description>Extra Actuator 1</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_2" value="246">
+                <description>Extra Actuator 2</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_3" value="247">
+                <description>Extra Actuator 3</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_4" value="248">
+                <description>Extra Actuator 4</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_5" value="249">
+                <description>Extra Actuator 5</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_6" value="250">
+                <description>Extra Actuator 6</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_7" value="251">
+                <description>Extra Actuator 7</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_8" value="252">
+                <description>Extra Actuator 8</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_9" value="253">
+                <description>Extra Actuator 9</description>
+            </entry>
+            <entry name="VALVE_ID_EXTRA_10" value="254">
+                <description>Extra Actuator 10</description>
+            </entry>
+        </enum>
+    </enums>
+    <messages>
+        <message id="20000" name="ROCKET_INFO">
+            <description>Static vehicle information advertised at low rate so the GCS can adapt to vehicle type.</description>
+            <field type="uint8_t" name="propulsion_type" enum="PROPULSION_TYPE">Propulsion type.</field>
+            <field type="uint16_t" name="capability_flags" enum="ROCKET_CAPABILITY" display="bitmask">Capability bitmask.</field>
+        </message>
+        <message id="20001" name="PRESSURE_VESSEL">
+            <description>TODO</description>
+            <field type="uint8_t" name="id" instance="true">Pressure Vessel ID</field>
+            <field type="uint16_t" name="flags" enum="PRESSURE_VESSEL_FLAG" display="bitmask">Pressure Vessel Flags</field>
+            <field type="uint16_t" name="fluid" enum="FLUID_TYPE">Contained Fluid</field>
+            <field type="uint16_t" name="pressure1" units="kPa">Measured Pressure (Sensor 1)</field>
+            <field type="uint16_t" name="pressure2" units="kPa">Measured Pressure (Sensor 2)</field>
+            <field type="uint16_t" name="rated_pressure" units="kPa">Rated Pressure</field>
+            <field type="int16_t" name="temperature1" units="cdegC">Measured Temperature (Sensor 1)</field>
+            <field type="int16_t" name="temperature2" units="cdegC">Measured Temperature (Sensor 2)</field>
+            <field type="uint16_t" name="volume" units="cm^3">Volume</field>
+            <field type="uint16_t" name="level" units="c%">Liquid level in tanks with (partially) liquid contents</field>
+        </message>
+        <message id="20002" name="VALVE">
+            <description>Reported and commanded state of a single valve.</description>
+            <field type="uint8_t" name="id" instance="true" enum="VALVE_ID">Valve identifier.</field>
+            <field type="float" name="state">Reported valve state.</field>
+            <field type="float" name="commanded">Last commanded state.</field>
+        </message>
+    </messages>
+</mavlink>
