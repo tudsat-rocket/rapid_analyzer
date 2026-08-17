@@ -1,5 +1,7 @@
 pub mod app;
 pub mod audio_playback;
+pub mod can;
+pub mod can_builder;
 pub mod colors;
 pub mod dialect;
 pub mod import;

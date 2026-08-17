@@ -14,17 +14,24 @@ and known limitations.
 ```sh
 cargo build --release
 cargo run --release -- log.tlog telemetry.sqlite video.mp4   # files are optional
-cargo test
+cargo test                                     # unit tests, plus headless UI tests in tests/ui.rs
 cargo test slice_matches_raw_when_small        # single test (unit tests live in src/series.rs)
 cargo clippy --all-targets
 cargo run --release --example bench_import -- <large.tlog>          # import + LOD query timings
 cargo run --release --example bench_import -- <large.tlog> --list   # every series: samples, span, unit
 ```
 
-System prerequisites: `pkg-config`, `libasound2-dev` (ALSA, for `rodio`), and `ffmpeg`/`ffprobe`
-on `PATH`. With Nix, `nix develop` provides all of these plus the `LD_LIBRARY_PATH` the
-unwrapped `cargo run` binary needs for wgpu/winit's `dlopen`ed libraries — without it a
-`cargo run` build will fail to open a window on NixOS.
+System prerequisites: `pkg-config`, ALSA headers (for `rodio`), and `ffmpeg`/`ffprobe`
+on `PATH` — per-distribution package names are in `README.md`. With Nix, `nix develop`
+provides all of these plus the `LD_LIBRARY_PATH` the unwrapped `cargo run` binary needs for
+wgpu/winit's `dlopen`ed libraries — without it a `cargo run` build will fail to open a window
+on NixOS.
+
+The video pane can only decode what the installed `ffmpeg` can: distribution builds
+(Fedora's `ffmpeg-free`, notably) ship with H.264/HEVC removed, and such a file decodes to
+*nothing* while the process still exits cleanly. That is why `FrameStream` captures ffmpeg's
+stderr and `VideoWorker` reports it when a fresh stream yields no frames — without it the
+symptom is a spinner that never resolves.
 
 `nix build .` / `nix flake check` only see git-tracked files, so run `git add -A` first in a
 fresh clone (a commit is not needed).
@@ -36,9 +43,11 @@ Everything hangs off two shared pieces of state, both owned by `App` (`src/app.r
 - **`Project`** (`src/model.rs`) — the list of imported `Source`s. Each source has a `kind`
   (`Log` / `Video` / `Audio`), a color, and a user-adjustable `offset_seconds`.
 - **`Timeline`** (`src/timeline.rs`) — the master clock: the visible window (`view_start`/
-  `view_end`), the playhead `cursor`, and play state. Every pane reads and writes this, which is
-  what makes graphs, video, and audio move together. Panning/zooming *any* plot writes the new
-  x-bounds back into `Timeline`, and every other pane picks them up on the next frame.
+  `view_end`), the playhead `cursor`, play state, and the `box_zoom` drag mode. Every pane reads
+  and writes this, which is what makes graphs, video, and audio move together. Panning/zooming
+  *any* plot writes the new x-bounds back into `Timeline`, and every other pane picks them up on
+  the next frame. Keyboard transport lives in `App::handle_shortcuts`, which drives the same
+  methods the toolbar buttons do.
 
 ### The time model (the thing to get right)
 
@@ -69,11 +78,29 @@ Imports run on a spawned thread and come back to the UI over an `mpsc` channel (
   from more than one sender. Enum fields (serialized as `{"type": "ENTRY"}`) and bitmasks
   (`"A | B"`) are resolved back to numbers; values equal to a field's `invalid` sentinel are
   dropped; `cdegC`-style units are scaled to the unit they name.
+  `CAN_FRAME` is the one message pulled out of that generic path — see "CAN" below.
 - `import/sqlite_log.rs` — pivots long-form `sensor_data(timestamp, sensor_name, value)` rows into
   one series per `sensor_name`.
 - `import/video.rs`, `import/audio.rs` — shell out to `ffprobe` (metadata) and `ffmpeg` (a
   streamed sequence of downscaled RGBA frames, see `FrameStream`; PCM for the waveform
   envelope). No decoder is linked in.
+
+### CAN
+
+`src/can/` exists because a CAN frame is a container, not a measurement: the generic tlog path
+would fold every node's traffic into one `CAN_FRAME.data[0]` series. `import/tlog.rs` diverts
+`CAN_FRAME` into `CanFrames` (kept whole on the `LogSource`, ~24 bytes a frame) and then:
+
+- `can/iocan.rs` decodes the IO boards' protocol into named series (`CAN_HCO[5].out2_pwm_us`,
+  `CAN_SENSOR[6].slot0`, ...). It **mirrors `iocan-proto` from the io board firmware repo** —
+  a protocol change there has to be repeated here. The kind table's *order* is the wire encoding,
+  so an inserted variant silently relabels everything after it; the tests pin it, along with each
+  frame's field offsets, against real frames. Note `device-conf/can-io.toml`'s comment table in
+  that repo is stale — `iocan-proto/src/ids.rs` is the authority.
+- `can/mod.rs`'s `SignalSpec` + `can_builder.rs` are the manual path for every other device on
+  the bus: identifier, byte offset, type, byte order, `raw × scale + offset`. The resulting
+  `TimeSeries` is appended to the source's `series` (kept sorted, since the sidebar groups by
+  contiguous name prefix), so it behaves like an imported one from there on.
 
 ### Performance model
 
@@ -106,12 +133,31 @@ panes to drop into `closed`, which `App` drains afterwards. Log series start hid
 carry hundreds of fields); media panes are shown on import.
 
 A `Plot` pane doesn't name a series — it names a `PlotSpec` in `App::plots` (`Plots`), which holds
-any number of `(source, series, colour)` entries plus a title and a normalize flag. That is what
-lets one graph carry pressure and temperature together. Ticking a series in the sidebar opens a
-new plot; the ➕ menu next to it adds the series to an existing one.
+any number of `(source, series, colour, axis)` entries plus a title, a normalize flag, and an
+optional manual y range. That is what lets one graph carry pressure and temperature together.
+Ticking a series in the sidebar opens a new plot; the ➕ menu next to it adds the series to an
+existing one.
+
+egui_plot draws one coordinate system, so the **second y axis** is a mapping, not a second plot:
+right-axis series are squeezed into the left axis' auto range by `AxisMap` and the extra
+`AxisHints` relabels the ticks on the way out. The map is built from both sides' *auto* ranges
+and then held fixed for the frame, so a zoom moves both sets of curves together instead of
+re-fitting one under the gesture.
+
+**Zoom** is deliberately one-dimensional by default: `allow_zoom`/`allow_drag` are x-only, so the
+value axis stays fitted to what is visible. egui_plot's boxed zoom is the exception — it is the
+one gesture that sets a y range, which the pane stores as `PlotSpec::y_manual` (cleared by `R`,
+the ⚙ menu, or any change to the plot's contents). `Plot::show` applies interactions *after* the
+build closure, so reading `response.transform.bounds()` back is how both axes' gestures are
+picked up despite `set_plot_bounds` being called every frame.
 
 Sidebar iteration borrows `self.project.sources` mutably, so every mutation is queued into a
-`PendingAction` vec and applied after the loop.
+`PendingAction` vec and applied after the loop. `App::remove_source` is the one that has to touch
+everything: panes, plots, the video/audio workers (whose `Drop` is what stops ffmpeg and the
+audio sink), and the timeline's bounds.
+
+`tests/ui.rs` draws panes headlessly through `egui::Context::run_ui` — no window, no GPU. That is
+where a panic in a layout closure or an axis computed from an empty range shows up.
 
 ## MAVLink dialect
 

@@ -54,6 +54,8 @@
               ./build.rs
               ./src
               ./examples
+              # The headless UI tests, so `nix flake check` runs them too.
+              ./tests
               # build.rs generates the `rapid` MAVLink dialect from these at
               # build time, so they are build inputs, not just docs.
               ./mavlink_dialects

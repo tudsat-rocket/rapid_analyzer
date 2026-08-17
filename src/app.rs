@@ -5,10 +5,11 @@ use std::time::Instant;
 
 use egui_tiles::{Tile, TileId};
 
+use crate::can_builder::{BuilderAction, CanBuilder};
 use crate::colors::color_for_index;
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
-use crate::panes::{AudioPlayerSlot, Pane, PlotId, Plots, TreeBehavior};
+use crate::panes::{AudioPlayerSlot, Pane, PlotAxis, PlotId, Plots, TreeBehavior};
 use crate::timeline::{self, Timeline};
 use crate::video_worker::VideoWorker;
 
@@ -23,8 +24,10 @@ enum PendingAction {
     AddPane(Pane),
     RemovePane(Pane),
     NewPlot(SourceId, String),
-    AddToPlot(PlotId, SourceId, String),
+    AddToPlot(PlotId, SourceId, String, PlotAxis),
     HideSeries(SourceId, String),
+    RemoveSource(SourceId),
+    OpenCanBuilder(SourceId),
 }
 
 pub struct App {
@@ -42,6 +45,9 @@ pub struct App {
     series_filter: String,
     last_update: Instant,
     ffmpeg_available: bool,
+    /// The CAN signal picker, while it is open. At most one at a time -- it
+    /// is a modal-ish tool, not a per-source panel.
+    can_builder: Option<CanBuilder>,
 }
 
 impl App {
@@ -62,6 +68,7 @@ impl App {
             series_filter: String::new(),
             last_update: Instant::now(),
             ffmpeg_available: import::video::ffmpeg_available(),
+            can_builder: None,
         };
         for path in initial_files {
             app.start_import(path);
@@ -117,7 +124,7 @@ impl App {
 
         if let Some(bounds) = self.project.time_bounds() {
             if self.project.sources.len() == 1 {
-                self.timeline = Timeline::new(bounds);
+                self.timeline.reset_to(bounds);
             } else {
                 self.timeline.view_start = self.timeline.view_start.min(bounds.0);
                 self.timeline.view_end = self.timeline.view_end.max(bounds.1);
@@ -173,8 +180,8 @@ impl App {
                 let id = self.plots.create(source, series);
                 self.add_pane(Pane::Plot(id));
             }
-            PendingAction::AddToPlot(plot, source, series) => {
-                self.plots.add(plot, source, series);
+            PendingAction::AddToPlot(plot, source, series, axis) => {
+                self.plots.add(plot, source, series, axis);
                 // The plot may exist without a pane if its tab was closed.
                 self.add_pane(Pane::Plot(plot));
             }
@@ -183,6 +190,93 @@ impl App {
                     self.remove_pane(&Pane::Plot(id));
                 }
             }
+            PendingAction::RemoveSource(source) => self.remove_source(source),
+            PendingAction::OpenCanBuilder(source) => {
+                if let Some(SourceKind::Log(log)) = self.project.source(source).map(|s| &s.kind) {
+                    self.can_builder = Some(CanBuilder::new(source, &log.can));
+                }
+            }
+        }
+    }
+
+    /// The CAN signal picker, and what it hands back: a series the log didn't
+    /// name itself, which joins that source's series list as if it had.
+    fn can_signal_builder(&mut self, ctx: &egui::Context) {
+        // Taken out for the duration so the window can read the source it
+        // belongs to while it draws.
+        let Some(mut builder) = self.can_builder.take() else {
+            return;
+        };
+        let source_id = builder.source();
+        let Some(source) = self.project.source(source_id) else {
+            return;
+        };
+        let SourceKind::Log(log) = &source.kind else {
+            return;
+        };
+
+        let action = builder.show(ctx, &source.name, &log.can);
+        match action {
+            BuilderAction::None => self.can_builder = Some(builder),
+            BuilderAction::Close => {}
+            BuilderAction::Plot(series) => {
+                let name = series.name.clone();
+                self.add_series(source_id, series);
+                let id = self.plots.create(source_id, name.clone());
+                self.add_pane(Pane::Plot(id));
+                self.status = Some(format!("Added {name}"));
+                self.can_builder = Some(builder);
+            }
+        }
+    }
+
+    /// Adds (or replaces) a series on a log source, keeping the list sorted
+    /// by name so the sidebar's grouping by message prefix still holds.
+    fn add_series(&mut self, source_id: SourceId, series: crate::series::TimeSeries) {
+        let Some(source) = self.project.sources.iter_mut().find(|s| s.id == source_id) else {
+            return;
+        };
+        let SourceKind::Log(log) = &mut source.kind else {
+            return;
+        };
+        match log.series.iter_mut().find(|s| s.name == series.name) {
+            // Re-adding under the same name is the user refining a signal
+            // (a scale factor, a different byte); replace it in place so the
+            // graph already showing it picks the change up.
+            Some(existing) => *existing = series,
+            None => {
+                log.series.push(series);
+                log.series.sort_by(|a, b| a.name.cmp(&b.name));
+            }
+        }
+    }
+
+    /// Unloads a source and everything that was showing it.
+    ///
+    /// Forgetting the workers is what actually stops the work: dropping a
+    /// `VideoWorker` closes its request channel, which ends the decode thread
+    /// and with it the `ffmpeg` it was running, and dropping an
+    /// `AudioPlayback` drops the rodio sink that was making the sound.
+    fn remove_source(&mut self, id: SourceId) {
+        self.remove_pane(&Pane::Video(id));
+        self.remove_pane(&Pane::Audio(id));
+        for plot in self.plots.remove_source(id) {
+            self.remove_pane(&Pane::Plot(plot));
+        }
+        self.video_workers.remove(&id);
+        self.audio_players.remove(&id);
+
+        let name = self.project.source(id).map(|s| s.name.clone());
+        self.project.sources.retain(|s| s.id != id);
+
+        // The timeline was sized to include this source; without it, the
+        // window and playhead can be left pointing at nothing.
+        match self.project.time_bounds() {
+            Some(bounds) => self.timeline.clamp_to(Some(bounds)),
+            None => self.timeline.reset_to((0.0, 1.0)),
+        }
+        if let Some(name) = name {
+            self.status = Some(format!("Removed {name}"));
         }
     }
 
@@ -231,7 +325,7 @@ impl App {
                     ui.checkbox(&mut source.enabled, "");
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                     ui.painter().rect_filled(rect, 2.0, source.color);
-                    ui.strong(&source.name);
+                    ui.strong(&source.name).on_hover_text(source.path.display().to_string());
                     let kind_tag = match &source.kind {
                         SourceKind::Log(log) => match log.format {
                             crate::model::LogFormat::Tlog => "tlog",
@@ -241,6 +335,15 @@ impl App {
                         SourceKind::Audio(_) => "audio",
                     };
                     ui.weak(format!("[{kind_tag}]"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("✖")
+                            .on_hover_text("Unload this source, and close every graph and panel showing it")
+                            .clicked()
+                        {
+                            pending.push(PendingAction::RemoveSource(source.id));
+                        }
+                    });
                 });
                 ui.horizontal(|ui| {
                     ui.add_space(18.0);
@@ -266,6 +369,21 @@ impl App {
                             .show(ui, |ui| {
                                 series_browser(ui, source.id, &log.series, plots, &filter, &mut pending);
                             });
+                        // The protocol-decoded signals are already in the
+                        // list above; this is for everything else on the bus.
+                        if !log.can.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.add_space(18.0);
+                                ui.weak(format!("{} CAN frames", log.can.len()));
+                                if ui
+                                    .small_button("＋ signal…")
+                                    .on_hover_text("Plot any byte range of any CAN identifier in this log")
+                                    .clicked()
+                                {
+                                    pending.push(PendingAction::OpenCanBuilder(source.id));
+                                }
+                            });
+                        }
                     }
                     SourceKind::Video(v) => {
                         let pane = Pane::Video(source.id);
@@ -293,6 +411,82 @@ impl App {
             self.apply(action);
         }
     }
+
+    /// Transport controls on the keyboard, so reviewing a run doesn't mean
+    /// hunting for a toolbar button between every step.
+    ///
+    /// Ignored while a text field has focus -- typing "b" into the series
+    /// filter must not toggle box zoom.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let bounds = self.project.time_bounds();
+        ctx.input(|i| {
+            // Shift for a coarse step, Alt for a fine one: the same gesture
+            // at three scales rather than three keys.
+            let step = if i.modifiers.shift {
+                10.0
+            } else if i.modifiers.alt {
+                0.1
+            } else {
+                1.0
+            };
+            for event in &i.events {
+                let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                // Held arrows should scrub; a held toggle should not flicker.
+                let toggle = matches!(key, egui::Key::Space | egui::Key::B | egui::Key::R);
+                if *repeat && toggle {
+                    continue;
+                }
+                match key {
+                    egui::Key::Space => self.timeline.playing = !self.timeline.playing,
+                    egui::Key::ArrowLeft => {
+                        self.timeline.step(-step, bounds);
+                        self.timeline.playing = false;
+                    }
+                    egui::Key::ArrowRight => {
+                        self.timeline.step(step, bounds);
+                        self.timeline.playing = false;
+                    }
+                    egui::Key::Home => self.timeline.seek(bounds.map_or(0.0, |(lo, _)| lo), bounds),
+                    egui::Key::End => self.timeline.seek(bounds.map_or(0.0, |(_, hi)| hi), bounds),
+                    egui::Key::ArrowUp => self.timeline.speed = next_speed(self.timeline.speed, 1),
+                    egui::Key::ArrowDown => self.timeline.speed = next_speed(self.timeline.speed, -1),
+                    // Zoom about the playhead: it is what the user is
+                    // looking at, and it keeps the moment of interest on
+                    // screen however far in they go.
+                    egui::Key::Plus | egui::Key::Equals => self.timeline.zoom_view(0.5, self.timeline.cursor),
+                    egui::Key::Minus => self.timeline.zoom_view(2.0, self.timeline.cursor),
+                    egui::Key::R if modifiers.is_none() => {
+                        self.timeline.reset_view(bounds);
+                        self.plots.clear_manual_ranges();
+                    }
+                    egui::Key::B if modifiers.is_none() => self.timeline.box_zoom = !self.timeline.box_zoom,
+                    _ => {}
+                }
+            }
+        });
+    }
+}
+
+/// The next playback speed up (`direction` 1) or down the ladder.
+fn next_speed(current: f32, direction: i32) -> f32 {
+    let speeds = timeline::SPEEDS;
+    let index = speeds
+        .iter()
+        .position(|s| (s - current).abs() < 1e-6)
+        .unwrap_or(speeds.len() / 2) as i32;
+    speeds[(index + direction).clamp(0, speeds.len() as i32 - 1) as usize]
 }
 
 /// The series list for one log source, grouped by message so a few hundred
@@ -392,10 +586,33 @@ fn series_row(
                     ui.separator();
                     ui.weak("Add to");
                     for plot in targets {
-                        if ui.button(plot.title()).clicked() {
-                            pending.push(PendingAction::AddToPlot(plot.id, source, series.name.clone()));
-                            ui.close();
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button(plot.title()).clicked() {
+                                pending.push(PendingAction::AddToPlot(
+                                    plot.id,
+                                    source,
+                                    series.name.clone(),
+                                    PlotAxis::Left,
+                                ));
+                                ui.close();
+                            }
+                            // Its own axis is what makes a series with a
+                            // wildly different scale -- thrust next to
+                            // pressure -- readable in the same graph.
+                            if ui
+                                .small_button("→R")
+                                .on_hover_text("Add on that plot's right-hand value axis")
+                                .clicked()
+                            {
+                                pending.push(PendingAction::AddToPlot(
+                                    plot.id,
+                                    source,
+                                    series.name.clone(),
+                                    PlotAxis::Right,
+                                ));
+                                ui.close();
+                            }
+                        });
                     }
                 }
             })
@@ -414,6 +631,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_imports();
+        self.handle_shortcuts(&ctx);
 
         let now = Instant::now();
         let dt = (now - self.last_update).as_secs_f64().min(0.25);
@@ -430,6 +648,8 @@ impl eframe::App for App {
         egui::Panel::top("timeline_bar").show(ui, |ui| {
             timeline::show(ui, &mut self.timeline, self.project.time_bounds());
         });
+
+        self.can_signal_builder(&ctx);
 
         let mut closed = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {

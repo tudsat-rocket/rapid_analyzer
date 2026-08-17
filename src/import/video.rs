@@ -5,6 +5,8 @@
 use std::io::{ErrorKind, Read};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use anyhow::{Context, Result};
 
@@ -81,6 +83,15 @@ const MAX_DECODE_WIDTH: u32 = 1280;
 pub struct FrameStream {
     child: Child,
     stdout: ChildStdout,
+    /// Whatever ffmpeg wrote to stderr, collected by `stderr_reader`. A
+    /// decoder this build of ffmpeg doesn't have ("no decoder found for:
+    /// hevc") is reported here and *only* here -- the process still starts,
+    /// still exits cleanly, and simply produces no frames -- so without
+    /// keeping it the failure is indistinguishable from a file that ended.
+    stderr: Arc<Mutex<String>>,
+    /// Drains stderr on its own thread: a per-frame warning would otherwise
+    /// fill the 64 KB pipe buffer and block ffmpeg mid-decode.
+    stderr_reader: Option<JoinHandle<()>>,
     width: u32,
     height: u32,
     frame_dt: f64,
@@ -114,14 +125,28 @@ impl FrameStream {
             .args(["-f", "rawvideo", "-pix_fmt", "rgba", "-"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .context("running ffmpeg to decode video (is it installed?)")?;
 
         let stdout = child.stdout.take().context("capturing ffmpeg stdout")?;
+        let stderr = Arc::new(Mutex::new(String::new()));
+        let stderr_reader = child.stderr.take().map(|mut pipe| {
+            let sink = Arc::clone(&stderr);
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                let _ = pipe.read_to_string(&mut text);
+                if let Ok(mut guard) = sink.lock() {
+                    *guard = text;
+                }
+            })
+        });
+
         Ok(Self {
             child,
             stdout,
+            stderr,
+            stderr_reader,
             width,
             height,
             frame_dt: 1.0 / fps,
@@ -142,6 +167,30 @@ impl FrameStream {
 
     pub fn exhausted(&self) -> bool {
         self.exhausted
+    }
+
+    /// What ffmpeg complained about, once it is done complaining.
+    ///
+    /// Only answers once the stream has run dry: getting the whole message
+    /// means waiting for ffmpeg to exit, and a process still mid-file is
+    /// blocked on a pipe we have stopped reading, so it would never exit.
+    pub fn failure(&mut self) -> Option<String> {
+        if !self.exhausted {
+            return None;
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        let text = self.stderr.lock().ok()?;
+        let message = text.trim();
+        if message.is_empty() {
+            return None;
+        }
+        // ffmpeg's diagnostics are one line per problem and repeat the same
+        // one for every frame; the first is the one that explains the rest.
+        let first = message.lines().next().unwrap_or(message);
+        Some(format!("ffmpeg: {}", first.trim()))
     }
 
     /// Decodes the next frame, or `None` at the end of the video.

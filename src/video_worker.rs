@@ -117,12 +117,26 @@ impl VideoWorker {
                             return;
                         }
                     }
-                    // A freshly started stream that yields nothing is past
-                    // the end of the file, whatever the container's declared
-                    // duration says.
-                    None if shown.is_none() && stream.exhausted() => {
-                        eof_after = Some(eof_after.map_or(t, |end| end.min(t)));
-                    }
+                    // A freshly started stream that yields nothing either ran
+                    // past the end of the file -- whatever the container's
+                    // declared duration says -- or never decoded anything at
+                    // all. Only ffmpeg's own diagnostics tell the two apart:
+                    // it exits cleanly either way, so a file this build has
+                    // no decoder for (`hevc` on a codec-stripped ffmpeg) is
+                    // otherwise indistinguishable from a finished video, and
+                    // shows up as a spinner that never resolves.
+                    None if shown.is_none() && stream.exhausted() => match stream.failure() {
+                        Some(error) => {
+                            if response_tx.send(Response::Error(error)).is_err() {
+                                return;
+                            }
+                            // Nothing about this file will decode later
+                            // either; stop respawning ffmpeg for it.
+                            decoder = None;
+                            eof_after = Some(0.0);
+                        }
+                        None => eof_after = Some(eof_after.map_or(t, |end| end.min(t))),
+                    },
                     None => {}
                 }
             }

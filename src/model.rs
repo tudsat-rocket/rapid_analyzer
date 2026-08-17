@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use egui::Color32;
 
+use crate::can::CanFrames;
 use crate::import::start_time::StartTimeSource;
 use crate::series::TimeSeries;
 
@@ -111,6 +112,9 @@ pub enum SourceKind {
 pub struct LogSource {
     pub series: Vec<TimeSeries>,
     pub format: LogFormat,
+    /// Raw CAN traffic the log carried, kept alongside the series decoded
+    /// from it so further signals can be pulled out without re-importing.
+    pub can: CanFrames,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

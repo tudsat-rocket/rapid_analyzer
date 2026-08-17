@@ -43,5 +43,6 @@ pub fn import(path: &Path) -> Result<LogSource> {
     Ok(LogSource {
         series: out,
         format: LogFormat::SqliteLog,
+        can: Default::default(),
     })
 }

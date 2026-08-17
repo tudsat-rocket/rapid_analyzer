@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use egui::{Color32, Widget as _};
-use egui_plot::{Corner, Legend, Line, Plot, PlotBounds, PlotPoints, VLine};
+use egui::{Color32, Vec2b, Widget as _};
+use egui_plot::{AxisHints, Corner, HPlacement, Legend, Line, Plot, PlotBounds, PlotPoints, VLine};
 
 use crate::audio_playback::AudioPlayback;
 use crate::colors::color_for_index;
@@ -25,12 +25,37 @@ const TARGET_PLOT_POINTS: usize = 2000;
 /// failed (e.g. headless machine, no sound card) -- don't retry every frame.
 pub type AudioPlayerSlot = Option<AudioPlayback>;
 
+/// Which of a graph's two value axes a series is drawn against.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PlotAxis {
+    #[default]
+    Left,
+    Right,
+}
+
+impl PlotAxis {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Left => "L",
+            Self::Right => "R",
+        }
+    }
+
+    fn flipped(self) -> Self {
+        match self {
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
 /// One series drawn in a graph.
 #[derive(Clone)]
 pub struct PlotEntry {
     pub source: SourceId,
     pub series: String,
     pub color: Color32,
+    pub axis: PlotAxis,
 }
 
 /// A graph pane: any number of series sharing one time axis.
@@ -47,8 +72,13 @@ pub struct PlotSpec {
     custom_title: String,
     /// Rescale every series to 0..1 over the visible window. The escape hatch
     /// for comparing quantities whose ranges are orders of magnitude apart,
-    /// where a shared axis would flatten one into a straight line.
+    /// where a shared axis would flatten one into a straight line -- and
+    /// unlike [`PlotAxis::Right`], it scales any number of series at once at
+    /// the cost of every axis number becoming meaningless.
     pub normalize: bool,
+    /// Value range fixed by a box zoom, in left-axis units. `None` means the
+    /// range follows whatever is visible.
+    pub y_manual: Option<(f64, f64)>,
     /// Kept separate from `entries.len()` so removing a series doesn't
     /// recolour the ones that stay.
     color_cursor: usize,
@@ -83,7 +113,7 @@ impl Plots {
         self.list.iter().find(|p| p.id == id)
     }
 
-    fn get_mut(&mut self, id: PlotId) -> Option<&mut PlotSpec> {
+    pub fn get_mut(&mut self, id: PlotId) -> Option<&mut PlotSpec> {
         self.list.iter_mut().find(|p| p.id == id)
     }
 
@@ -96,13 +126,14 @@ impl Plots {
             entries: Vec::new(),
             custom_title: String::new(),
             normalize: false,
+            y_manual: None,
             color_cursor: 0,
         });
-        self.add(id, source, series);
+        self.add(id, source, series, PlotAxis::Left);
         id
     }
 
-    pub fn add(&mut self, id: PlotId, source: SourceId, series: String) {
+    pub fn add(&mut self, id: PlotId, source: SourceId, series: String, axis: PlotAxis) {
         let Some(plot) = self.get_mut(id) else {
             return;
         };
@@ -111,7 +142,14 @@ impl Plots {
         }
         let color = color_for_index(plot.color_cursor);
         plot.color_cursor += 1;
-        plot.entries.push(PlotEntry { source, series, color });
+        plot.entries.push(PlotEntry {
+            source,
+            series,
+            color,
+            axis,
+        });
+        // A range picked for the old contents would just clip the new series.
+        plot.y_manual = None;
     }
 
     pub fn shows(&self, source: SourceId, series: &str) -> bool {
@@ -137,6 +175,14 @@ impl Plots {
 
     pub fn close(&mut self, id: PlotId) {
         self.list.retain(|p| p.id != id);
+    }
+
+    /// Puts every graph's value axis back on autoscale, the other half of
+    /// "reset the zoom".
+    pub fn clear_manual_ranges(&mut self) {
+        for plot in &mut self.list {
+            plot.y_manual = None;
+        }
     }
 
     fn empty_plots(&self) -> Vec<PlotId> {
@@ -212,10 +258,96 @@ struct PreparedSeries {
     label: String,
     color: Color32,
     unit: Option<String>,
+    axis: PlotAxis,
     points: Vec<[f64; 2]>,
     /// Value range over the visible window, before any normalization.
     bounds: Option<(f64, f64)>,
     at_cursor: Option<f64>,
+}
+
+/// The affine map from a right-axis series' own values into the plot's
+/// (left-axis) coordinates.
+///
+/// egui_plot draws one coordinate system, so a second axis is a matter of
+/// squeezing the right-hand series into the left-hand range and relabelling
+/// the ticks on the way out -- which is all a twin axis ever is. The map is
+/// built from the *auto* ranges of both sides and then held fixed, so zooming
+/// moves both sets of curves together instead of re-fitting one of them under
+/// the user's gesture.
+#[derive(Clone, Copy)]
+struct AxisMap {
+    from: (f64, f64),
+    to: (f64, f64),
+}
+
+impl AxisMap {
+    fn plot_y(&self, value: f64) -> f64 {
+        let span = self.from.1 - self.from.0;
+        if span.abs() < f64::EPSILON {
+            return (self.to.0 + self.to.1) * 0.5;
+        }
+        self.to.0 + (value - self.from.0) / span * (self.to.1 - self.to.0)
+    }
+
+    fn axis_value(&self, y: f64) -> f64 {
+        let span = self.to.1 - self.to.0;
+        if span.abs() < f64::EPSILON {
+            return self.from.0;
+        }
+        self.from.0 + (y - self.to.0) / span * (self.from.1 - self.from.0)
+    }
+
+    /// What one plot-coordinate step is worth on the right axis, for picking
+    /// how many decimals its tick labels need.
+    fn step_scale(&self) -> f64 {
+        let span = self.to.1 - self.to.0;
+        if span.abs() < f64::EPSILON {
+            1.0
+        } else {
+            (self.from.1 - self.from.0) / span
+        }
+    }
+}
+
+/// Value range for an axis: the union of what its series cover in the visible
+/// window, with a little headroom, or a usable default when it has no data.
+fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+    let bounds = series.fold(None, |acc, (lo, hi)| {
+        Some(match acc {
+            Some((a, b)) => (f64::min(a, lo), f64::max(b, hi)),
+            None => (lo, hi),
+        })
+    });
+    Some(match bounds? {
+        (lo, hi) if hi > lo => {
+            let pad = (hi - lo) * 0.1;
+            (lo - pad, hi + pad)
+        }
+        // A flat line still needs an axis to sit in the middle of.
+        (v, _) => (v - 1.0, v + 1.0),
+    })
+}
+
+/// Tick label for a value axis whose numbers we relabel ourselves, matching
+/// the precision to the spacing between ticks.
+fn format_axis_value(value: f64, step: f64) -> String {
+    let decimals = if step > 0.0 {
+        (-step.log10().floor()).clamp(0.0, 6.0) as usize
+    } else {
+        3
+    };
+    format!("{value:.decimals$}")
+}
+
+/// The distinct units among a set of series, in the order they appear.
+fn unit_label<'s>(series: impl Iterator<Item = &'s PreparedSeries>) -> String {
+    let mut units: Vec<&str> = Vec::new();
+    for unit in series.filter_map(|s| s.unit.as_deref()) {
+        if !units.contains(&unit) {
+            units.push(unit);
+        }
+    }
+    units.join(" / ")
 }
 
 impl<'a> TreeBehavior<'a> {
@@ -247,14 +379,21 @@ impl<'a> TreeBehavior<'a> {
                 continue;
             };
             let offset = source.offset_seconds;
+            let mut label = if multi_source {
+                format!("{} [{}]", entry.series, source.name)
+            } else {
+                entry.series.clone()
+            };
+            // Which axis a line is read against has to be visible on the line
+            // itself; the numbers on the two sides are otherwise unattributable.
+            if entry.axis == PlotAxis::Right {
+                label.push_str(" (R)");
+            }
             prepared.push(PreparedSeries {
-                label: if multi_source {
-                    format!("{} [{}]", entry.series, source.name)
-                } else {
-                    entry.series.clone()
-                },
+                label,
                 color: entry.color,
                 unit: series.unit.clone(),
+                axis: entry.axis,
                 points: series.slice_for_range(view_start, view_end, offset, TARGET_PLOT_POINTS),
                 bounds: series.value_bounds_in_range(view_start, view_end, offset),
                 at_cursor: series.value_at(cursor, offset),
@@ -279,23 +418,42 @@ impl<'a> TreeBehavior<'a> {
                     );
                     ui.checkbox(&mut plot.normalize, "Normalize each series to 0..1")
                         .on_hover_text("Compare shapes when the series don't share a scale");
+                    if plot.y_manual.is_some() && ui.button("⟲ Auto value range").clicked() {
+                        plot.y_manual = None;
+                    }
                     ui.separator();
                     ui.label("Series");
                     let mut drop = None;
-                    for entry in &plot.entries {
+                    let mut flip = None;
+                    for (i, entry) in plot.entries.iter().enumerate() {
                         ui.horizontal(|ui| {
                             let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                             ui.painter().rect_filled(rect, 2.0, entry.color);
                             ui.label(&entry.series);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.small_button("✖").on_hover_text("Remove from this plot").clicked() {
-                                    drop = Some(entry.series.clone());
+                                    drop = Some(i);
+                                }
+                                // The whole point of the right axis is a
+                                // series whose scale swamps the others, so
+                                // the switch belongs next to that series.
+                                if ui
+                                    .small_button(entry.axis.label())
+                                    .on_hover_text("Draw this against the left / right value axis")
+                                    .clicked()
+                                {
+                                    flip = Some(i);
                                 }
                             });
                         });
                     }
-                    if let Some(series) = drop {
-                        plot.entries.retain(|e| e.series != series);
+                    if let Some(i) = flip {
+                        plot.entries[i].axis = plot.entries[i].axis.flipped();
+                        plot.y_manual = None;
+                    }
+                    if let Some(i) = drop {
+                        plot.entries.remove(i);
+                        plot.y_manual = None;
                         if plot.entries.is_empty() {
                             self.closed.push(Pane::Plot(plot_id));
                         }
@@ -312,58 +470,98 @@ impl<'a> TreeBehavior<'a> {
             }
         });
 
-        // --- y axis: the union of every series' visible range, or 0..1 when
-        // each series is rescaled onto its own range ---
-        let (y_lo, y_hi) = if normalize {
+        // --- value axes ---
+        //
+        // Each axis covers the union of its own series' visible range. A
+        // series on the right is then mapped into the left axis' range for
+        // drawing, so a thrust curve in kN and a pressure in bar can share a
+        // graph without either being flattened into a straight line.
+        let has_right = prepared.iter().any(|s| s.axis == PlotAxis::Right) && !normalize;
+        let range_of = |axis: PlotAxis| {
+            axis_range(
+                prepared
+                    .iter()
+                    .filter(|s| s.axis == axis)
+                    .filter_map(|s| s.bounds),
+            )
+        };
+        let left_range = range_of(PlotAxis::Left);
+        let right_range = range_of(PlotAxis::Right);
+
+        // With nothing on the left, right-axis series keep their own numbers
+        // rather than being mapped into a range that isn't there.
+        let auto_y = if normalize {
             (-0.05, 1.05)
         } else {
-            let bounds = prepared.iter().filter_map(|s| s.bounds).fold(None, |acc, (lo, hi)| {
-                Some(match acc {
-                    Some((a, b)) => (f64::min(a, lo), f64::max(b, hi)),
-                    None => (lo, hi),
-                })
-            });
-            match bounds {
-                Some((lo, hi)) if hi > lo => {
-                    let pad = (hi - lo) * 0.1;
-                    (lo - pad, hi + pad)
-                }
-                Some((v, _)) => (v - 1.0, v + 1.0),
-                None => (0.0, 1.0),
-            }
+            left_range.or(right_range).unwrap_or((0.0, 1.0))
+        };
+        let right_map = AxisMap {
+            from: right_range.unwrap_or(auto_y),
+            to: auto_y,
+        };
+        let (y_lo, y_hi) = match plot.y_manual {
+            Some(range) if !normalize => range,
+            _ => auto_y,
         };
 
-        let units: Vec<&str> = prepared
-            .iter()
-            .filter_map(|s| s.unit.as_deref())
-            .fold(Vec::new(), |mut acc, u| {
-                if !acc.contains(&u) {
-                    acc.push(u);
-                }
-                acc
-            });
-        let y_label = if normalize {
+        let left_label = if normalize {
             "normalized".to_string()
         } else {
-            units.join(" / ")
+            unit_label(prepared.iter().filter(|s| s.axis == PlotAxis::Left))
         };
+        let right_label = unit_label(prepared.iter().filter(|s| s.axis == PlotAxis::Right));
 
-        let hover_units = units.clone();
-        let plot_widget = Plot::new(("plot", plot_id))
+        // The hover readout has to undo the mapping again, so it needs to
+        // know which line it is over -- which is what `plot_name` is for.
+        let hover: Vec<(String, PlotAxis, Option<String>)> = prepared
+            .iter()
+            .map(|s| (s.label.clone(), s.axis, s.unit.clone()))
+            .collect();
+        let box_zoom = self.timeline.box_zoom;
+
+        let mut plot_widget = Plot::new(("plot", plot_id))
             .height(ui.available_height().max(80.0))
-            .allow_boxed_zoom(false)
+            // Scrolling and dragging move the shared time window; the value
+            // axis stays fitted to the data unless a box zoom pins it.
+            .allow_zoom(Vec2b::new(true, false))
+            .allow_drag(Vec2b::new(!box_zoom, false))
+            .allow_boxed_zoom(true)
+            .boxed_zoom_pointer_button(if box_zoom {
+                egui::PointerButton::Primary
+            } else {
+                egui::PointerButton::Secondary
+            })
             .legend(Legend::default().position(Corner::LeftTop))
-            .y_axis_label(y_label)
             .x_axis_formatter(|mark, _| crate::timeline::format_axis_time(mark.value, mark.step_size))
             .x_grid_spacer(egui_plot::uniform_grid_spacer(crate::timeline::time_grid_steps))
             .label_formatter(move |pos| {
-                let p = match pos {
-                    egui_plot::HoverPosition::NearDataPoint { position, .. } => *position,
-                    egui_plot::HoverPosition::Elsewhere { position } => *position,
+                let (name, p) = match pos {
+                    egui_plot::HoverPosition::NearDataPoint { plot_name, position, .. } => (Some(*plot_name), *position),
+                    egui_plot::HoverPosition::Elsewhere { position } => (None, *position),
                 };
-                let unit = if hover_units.len() == 1 { hover_units[0] } else { "" };
-                Some(format!("{:.4} {unit}\n{}", p.y, crate::timeline::format_utc(p.x)))
+                let hovered = name.and_then(|n| hover.iter().find(|(label, _, _)| label == n));
+                let (value, unit) = match hovered {
+                    Some((_, PlotAxis::Right, unit)) => (right_map.axis_value(p.y), unit.as_deref().unwrap_or("")),
+                    Some((_, PlotAxis::Left, unit)) => (p.y, unit.as_deref().unwrap_or("")),
+                    None => (p.y, ""),
+                };
+                Some(format!("{value:.4} {unit}\n{}", crate::timeline::format_utc(p.x)))
             });
+
+        if has_right {
+            let step_scale = right_map.step_scale();
+            plot_widget = plot_widget.custom_y_axes(vec![
+                AxisHints::new_y().label(left_label),
+                AxisHints::new_y()
+                    .label(right_label)
+                    .placement(HPlacement::Right)
+                    .formatter(move |mark, _| {
+                        format_axis_value(right_map.axis_value(mark.value), mark.step_size * step_scale)
+                    }),
+            ]);
+        } else {
+            plot_widget = plot_widget.y_axis_label(left_label);
+        }
 
         let mut clicked_time = None;
         let response = plot_widget.show(ui, |plot_ui| {
@@ -379,6 +577,12 @@ impl<'a> TreeBehavior<'a> {
                     // A flat series has no range to normalize against; park
                     // it in the middle rather than dividing by zero.
                     (true, _) => series.points.iter().map(|p| [p[0], 0.5]).collect::<Vec<_>>().into(),
+                    (false, _) if series.axis == PlotAxis::Right => series
+                        .points
+                        .iter()
+                        .map(|p| [p[0], right_map.plot_y(p[1])])
+                        .collect::<Vec<_>>()
+                        .into(),
                     (false, _) => series.points.clone().into(),
                 };
                 plot_ui.line(Line::new(series.label.clone(), points).color(series.color));
@@ -390,7 +594,12 @@ impl<'a> TreeBehavior<'a> {
                 }
         });
 
-        self.apply_view_change(&response.transform, clicked_time);
+        let zoomed_y = self.apply_view_change(&response.transform, (y_lo, y_hi), clicked_time);
+        if let Some(range) = zoomed_y
+            && !normalize
+            && let Some(plot) = self.plots.get_mut(plot_id) {
+                plot.y_manual = Some(range);
+            }
     }
 
     fn video_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
@@ -454,6 +663,11 @@ impl<'a> TreeBehavior<'a> {
             egui::Image::new(texture).fit_to_exact_size(size).ui(ui);
         } else if let Some(err) = &worker.error {
             ui.colored_label(Color32::RED, err);
+            // The overwhelmingly common one, and not obvious from ffmpeg's
+            // wording: distributions ship builds with whole codecs removed.
+            if err.contains("no decoder found") {
+                ui.small("This ffmpeg build has no decoder for that codec -- see the README for a build that does.");
+            }
         } else {
             ui.spinner();
         }
@@ -506,15 +720,26 @@ impl<'a> TreeBehavior<'a> {
         }
 
         let cursor = self.timeline.cursor;
+        let box_zoom = self.timeline.box_zoom;
         let mut clicked_time = None;
+        // A waveform's amplitude axis has no range worth zooming into, so a
+        // box here only ever selects a stretch of time.
+        let (y_lo, y_hi) = (-1.05, 1.05);
         let plot = Plot::new(("audio", source_id))
             .height(ui.available_height().max(60.0))
-            .allow_boxed_zoom(false)
+            .allow_zoom(Vec2b::new(true, false))
+            .allow_drag(Vec2b::new(!box_zoom, false))
+            .allow_boxed_zoom(true)
+            .boxed_zoom_pointer_button(if box_zoom {
+                egui::PointerButton::Primary
+            } else {
+                egui::PointerButton::Secondary
+            })
             .show_y(false)
             .x_axis_formatter(|mark, _| crate::timeline::format_axis_time(mark.value, mark.step_size))
             .x_grid_spacer(egui_plot::uniform_grid_spacer(crate::timeline::time_grid_steps));
         let response = plot.show(ui, |plot_ui| {
-            plot_ui.set_plot_bounds(PlotBounds::from_min_max([view_start, -1.05], [view_end, 1.05]));
+            plot_ui.set_plot_bounds(PlotBounds::from_min_max([view_start, y_lo], [view_end, y_hi]));
             let pts: PlotPoints = env.clone().into();
             plot_ui.line(Line::new("waveform", pts).color(color));
             plot_ui.vline(VLine::new("cursor", cursor).color(CURSOR_COLOR));
@@ -523,7 +748,7 @@ impl<'a> TreeBehavior<'a> {
                     clicked_time = Some(coord.x);
                 }
         });
-        self.apply_view_change(&response.transform, clicked_time);
+        self.apply_view_change(&response.transform, (y_lo, y_hi), clicked_time);
 
         if matches!(self.audio_players.get(&source_id), Some(None)) {
             ui.colored_label(Color32::YELLOW, "audio playback unavailable (no output device) -- waveform still shown");
@@ -532,17 +757,30 @@ impl<'a> TreeBehavior<'a> {
 
     /// Panning or zooming any plot moves every other pane with it, and a
     /// click on one moves the playhead.
-    fn apply_view_change(&mut self, transform: &egui_plot::PlotTransform, clicked_time: Option<f64>) {
+    ///
+    /// Returns the value range the user's gesture ended up with, when that is
+    /// not the `expected_y` the pane asked for -- a box zoom is the only thing
+    /// that can do that, and the pane holds on to it as its manual range.
+    fn apply_view_change(
+        &mut self,
+        transform: &egui_plot::PlotTransform,
+        expected_y: (f64, f64),
+        clicked_time: Option<f64>,
+    ) -> Option<(f64, f64)> {
         let bounds = transform.bounds();
         let (nx0, nx1) = (bounds.min()[0], bounds.max()[0]);
         if (nx0 - self.timeline.view_start).abs() > 1e-6 || (nx1 - self.timeline.view_end).abs() > 1e-6 {
-            self.timeline.view_start = nx0;
-            self.timeline.view_end = nx1;
+            self.timeline.set_view(nx0, nx1);
         }
         if let Some(t) = clicked_time {
             self.timeline.seek(t, self.project.time_bounds());
             self.timeline.playing = false;
         }
+
+        let (ny0, ny1) = (bounds.min()[1], bounds.max()[1]);
+        let tolerance = (expected_y.1 - expected_y.0).abs() * 1e-6;
+        let moved = (ny0 - expected_y.0).abs() > tolerance || (ny1 - expected_y.1).abs() > tolerance;
+        (moved && ny1 > ny0).then_some((ny0, ny1))
     }
 
     fn ensure_audio_player(&mut self, source_id: SourceId, path: &std::path::Path) {
@@ -613,6 +851,7 @@ mod tests {
                 source: 0,
                 series: n.to_string(),
                 color: Color32::WHITE,
+                axis: PlotAxis::Left,
             })
             .collect()
     }
@@ -638,7 +877,7 @@ mod tests {
     fn removing_the_last_series_reports_the_plot_as_empty() {
         let mut plots = Plots::default();
         let id = plots.create(0, "a".to_string());
-        plots.add(id, 0, "b".to_string());
+        plots.add(id, 0, "b".to_string(), PlotAxis::Left);
         assert!(plots.remove_series(0, "a").is_empty());
         assert_eq!(plots.remove_series(0, "b"), vec![id]);
     }
@@ -647,10 +886,61 @@ mod tests {
     fn a_series_is_only_added_once_per_plot() {
         let mut plots = Plots::default();
         let id = plots.create(0, "a".to_string());
-        plots.add(id, 0, "a".to_string());
+        plots.add(id, 0, "a".to_string(), PlotAxis::Left);
         assert_eq!(plots.get(id).unwrap().entries.len(), 1);
         // ... but the same series in a second plot is fine.
         let other = plots.create(0, "a".to_string());
         assert!(plots.get(other).unwrap().contains(0, "a"));
+    }
+
+    #[test]
+    fn dropping_a_source_leaves_the_other_sources_series_alone() {
+        let mut plots = Plots::default();
+        let id = plots.create(0, "a".to_string());
+        plots.add(id, 1, "a".to_string(), PlotAxis::Right);
+        assert!(plots.remove_source(0).is_empty(), "the plot still has source 1's series");
+        assert_eq!(plots.get(id).unwrap().entries.len(), 1);
+        assert_eq!(plots.remove_source(1), vec![id]);
+    }
+
+    #[test]
+    fn the_right_axis_maps_its_range_onto_the_left_one() {
+        // A thrust curve of 0..8000 N drawn against a 0..60 bar pressure axis.
+        let map = AxisMap {
+            from: (0.0, 8000.0),
+            to: (0.0, 60.0),
+        };
+        assert_eq!(map.plot_y(0.0), 0.0);
+        assert_eq!(map.plot_y(8000.0), 60.0);
+        assert_eq!(map.plot_y(4000.0), 30.0);
+        // Tick labels on the right axis undo it exactly.
+        assert_eq!(map.axis_value(30.0), 4000.0);
+        assert!((map.axis_value(map.plot_y(1234.0)) - 1234.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_flat_right_axis_series_does_not_divide_by_zero() {
+        let map = AxisMap {
+            from: (5.0, 5.0),
+            to: (0.0, 10.0),
+        };
+        assert!(map.plot_y(5.0).is_finite());
+        assert!(map.axis_value(0.0).is_finite());
+        assert!(map.step_scale().is_finite());
+    }
+
+    #[test]
+    fn an_axis_range_has_headroom_and_survives_a_flat_line() {
+        assert_eq!(axis_range([(0.0, 10.0)].into_iter()), Some((-1.0, 11.0)));
+        assert_eq!(axis_range([(0.0, 10.0), (-5.0, 1.0)].into_iter()), Some((-6.5, 11.5)));
+        assert_eq!(axis_range([(3.0, 3.0)].into_iter()), Some((2.0, 4.0)));
+        assert_eq!(axis_range(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn axis_tick_labels_follow_the_tick_spacing() {
+        assert_eq!(format_axis_value(1234.5678, 100.0), "1235");
+        assert_eq!(format_axis_value(1.2345678, 0.05), "1.23");
+        assert_eq!(format_axis_value(1.2345678, 0.001), "1.235");
     }
 }

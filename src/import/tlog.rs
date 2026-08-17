@@ -12,6 +12,7 @@ use mavlink_core::peek_reader::PeekReader;
 use mavlink_core::{Message, ReadVersion, error::MessageReadError};
 use serde_json::Value;
 
+use crate::can::{CanFrame, CanFrames, iocan};
 use crate::dialect::rapid::MavMessage;
 use crate::mavlink_meta::{self, FieldMeta};
 use crate::model::{LogFormat, LogSource};
@@ -54,16 +55,18 @@ pub fn import(path: &Path) -> Result<LogSource> {
 
     anyhow::ensure!(n_messages > 0, "no valid MAVLink messages found in {}", path.display());
 
-    let series = collector.finish();
+    let (series, can) = collector.finish();
     log::info!(
-        "{}: {n_messages} messages -> {} series",
+        "{}: {n_messages} messages -> {} series ({} CAN frames)",
         path.display(),
-        series.len()
+        series.len(),
+        can.len(),
     );
 
     Ok(LogSource {
         series,
         format: LogFormat::Tlog,
+        can,
     })
 }
 
@@ -100,10 +103,26 @@ struct GroupKey {
 #[derive(Default)]
 struct Collector {
     groups: HashMap<GroupKey, Group>,
+    can: CanFrames,
 }
 
 impl Collector {
     fn push_message(&mut self, msg: &MavMessage, system: u8, component: u8, t_utc: f64) {
+        // A forwarded CAN frame is a container, not a measurement: its `id`
+        // says which node sent which signal, so expanding it field-by-field
+        // like every other message would fold every node's traffic into one
+        // `CAN_FRAME.data[0]` line. It goes to `crate::can` instead.
+        if let MavMessage::CAN_FRAME(frame) = msg {
+            self.can.push(CanFrame {
+                t_utc,
+                id: frame.id,
+                bus: frame.bus,
+                len: frame.len,
+                data: frame.data,
+            });
+            return;
+        }
+
         let message = msg.message_name();
         let Ok(Value::Object(map)) = serde_json::to_value(msg) else {
             return;
@@ -138,7 +157,7 @@ impl Collector {
         }
     }
 
-    fn finish(self) -> Vec<TimeSeries> {
+    fn finish(self) -> (Vec<TimeSeries>, CanFrames) {
         // Only spell out the sending system when the log actually carries
         // more than one, so the common single-vehicle case stays readable.
         let mut senders: HashMap<&'static str, Vec<(u8, u8)>> = HashMap::new();
@@ -172,8 +191,9 @@ impl Collector {
                 out.push(TimeSeries::from_points(format!("{prefix}.{field}"), points).with_unit(unit));
             }
         }
+        out.extend(iocan::decode(self.can.frames()));
         out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+        (out, self.can)
     }
 }
 
@@ -272,7 +292,7 @@ mod tests {
         for (i, (msg, system)) in messages.iter().enumerate() {
             collector.push_message(msg, *system, 1, i as f64);
         }
-        collector.finish().into_iter().map(|s| s.name).collect()
+        collector.finish().0.into_iter().map(|s| s.name).collect()
     }
 
     fn pressure_vessel(id: u8, pressure1: u16, temperature1: i16) -> MavMessage {
@@ -328,7 +348,7 @@ mod tests {
     fn centi_units_are_scaled_to_their_display_unit() {
         let mut collector = Collector::default();
         collector.push_message(&pressure_vessel(1, 110, 2144), 4, 1, 0.0);
-        let series = collector.finish();
+        let (series, _) = collector.finish();
         let temp = series
             .iter()
             .find(|s| s.name == "PRESSURE_VESSEL[1].temperature1")
