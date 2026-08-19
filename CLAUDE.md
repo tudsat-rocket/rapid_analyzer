@@ -85,6 +85,26 @@ Imports run on a spawned thread and come back to the UI over an `mpsc` channel (
   streamed sequence of downscaled RGBA frames, see `FrameStream`; PCM for the waveform
   envelope). No decoder is linked in.
 
+### Nitrous oxide phase
+
+`src/n2o.rs` is data and physics with no UI: the NIST saturation table for N₂O
+(reproduced verbatim -- see the module docs for why not a correlation),
+`psat_kpa`/`tsat_k` either way across it, and `state()`, which classifies a
+(T, P) pair into a `Phase`. `src/vapor.rs` is the pane on top: series picking
+(with a guesser that prefers a temperature and a pressure describing the same
+vessel), unit handling, and the two views. Things that are easy to get wrong
+and are therefore pinned by tests:
+
+- **Units.** Series carry `°C`/`bar`/`kPa`; the curve is K and kPa absolute.
+  A *difference* converts differently from a *reading* (`delta_from_kelvin`),
+  and a gauge reading needs an atmosphere added — a bar, which at tank
+  pressures is the width of the saturated band, so it is a switch in the UI.
+- **Pairing.** The two series are logged independently, so the sparser one is
+  interpolated onto the denser one's timestamps, and only where the other
+  series actually has data — holding its last value would invent a phase.
+- **Gaps.** Above the critical temperature there is no saturation state, so
+  the trace and its zones break into runs rather than being drawn through.
+
 ### CAN
 
 `src/can/` exists because a CAN frame is a container, not a measurement: the generic tlog path
@@ -126,7 +146,7 @@ drifts >0.3 s from the timeline cursor; a missing output device is cached as `No
 ### UI panes
 
 `egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot(PlotId)`,
-`Video`, `Audio`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
+`Video`, `Audio`, `Vapor(VaporId)`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
 checkboxes and tab close buttons add/remove panes through it, so both must stay in sync
 (`add_pane`/`remove_pane`). Closures inside `tree.ui` can't reach `App`, so `TreeBehavior` collects
 panes to drop into `closed`, which `App` drains afterwards. Log series start hidden (a tlog can
@@ -142,7 +162,14 @@ egui_plot draws one coordinate system, so the **second y axis** is a mapping, no
 right-axis series are squeezed into the left axis' auto range by `AxisMap` and the extra
 `AxisHints` relabels the ticks on the way out. The map is built from both sides' *auto* ranges
 and then held fixed for the frame, so a zoom moves both sets of curves together instead of
-re-fitting one under the gesture.
+re-fitting one under the gesture. `zero_aligned` runs both ranges through `align_zero` first,
+which only ever *expands* them — a range that shrank would clip the data being compared.
+
+The sidebar must never size itself by its text: egui gives a panel the width its contents ask
+for and persists it, so one long file name would take half the window for the rest of the
+session. Everything in it truncates (`wrap_mode` on the scroll area's `Ui`), and the source name
+wraps into whatever the trailing controls leave it. `app.rs`'s test lays out a header row in a
+320 px `Ui` and checks it stayed inside.
 
 **Zoom** is deliberately one-dimensional by default: `allow_zoom`/`allow_drag` are x-only, so the
 value axis stays fitted to what is visible. egui_plot's boxed zoom is the exception — it is the

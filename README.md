@@ -36,7 +36,12 @@ zoomed together.
   thrust curve in newtons next to a pressure in bar -- can be drawn against
   the graph's right-hand axis instead, with its own numbers and unit. Add it
   there with `→R` in the ➕ menu, or flip an existing one with the `L`/`R`
-  button in the graph's ⚙ menu.
+  button in the graph's ⚙ menu. "Line up both axes at zero" in the same menu
+  puts both zeros at the same height, for two quantities that are only
+  comparable when "nothing" is on the same line.
+- **N₂O phase**: a pane that reads a temperature and a pressure series against
+  the nitrous oxide vapour pressure curve and says which side of it the tank
+  was on, at every instant -- see "Nitrous oxide phase" below.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
   any graph, adjustable playback speed, and keyboard shortcuts for all of it
   (see below).
@@ -189,6 +194,55 @@ To add or change project messages, edit `mavlink_dialects/Rapid.xml`
 and rebuild; `cargo` reruns `build.rs` automatically when that file
 changes.
 
+## Nitrous oxide phase
+
+Nitrous oxide is only understandable as a point relative to its own vapour
+pressure: the same 50 bar is a cold, full, self-pressurising tank at 20 °C and
+a warm nearly-empty one at 25 °C, and neither the pressure trace nor the
+temperature trace says which. "＋ N₂O phase plot" in the sidebar opens a pane
+that puts the two together against the saturation curve. It opens already
+pointed at the most likely pair of series in the project (or straight at the
+bare curve, if there is nothing to compare -- the button is there with nothing
+imported at all) -- picked by their
+declared units first and their names second, preferring two that describe the
+same vessel -- and has two views:
+
+- **State over time** draws `P − Psat(T)` along the master timeline, with the
+  three zones shaded behind it: above the band the fluid is subcooled liquid,
+  inside it the tank is saturated (liquid and vapour in equilibrium, where a
+  self-pressurising tank lives), below it the gas is superheated. The band is
+  a tolerance, not physics: a tank at equilibrium never reads exactly on the
+  curve, because a 1 % transducer and a thermocouple a kelvin out already put
+  the point a bar off it. It defaults to ±2 % of the vapour pressure and is
+  adjustable. Stretches above the critical temperature have no saturation
+  state at all, so the zones stop there rather than being drawn through.
+- **Vapour pressure curve** is the phase diagram: pressure against
+  temperature, the curve from the triple point to the critical point, the
+  zones either side of it, and the run itself drawn on top, one colour per
+  phase, with the playhead marked. With no series selected it is just the
+  curve -- a static reference plot.
+
+Hovering either view reports the phase, the temperature and pressure, the
+vapour pressure at that temperature (and how far from it the point is), the
+boiling point at that pressure (and the superheat), and the distance to the
+critical point. The playhead readout above the plot says the same thing in a
+line, so the state at the current instant is readable without hovering.
+
+`✖` in the pane's own header closes it -- unlike a graph, it is not made of
+series the sidebar can untick, so the button has to be on the pane.
+
+Units are taken from what each series declares (`°C`, `K`, `bar`, `kPa`,
+`MPa`, `psi`, `Pa`) and can be overridden. **Absolute vs gauge matters**: a
+gauge reading is an atmosphere low, which at tank pressures is about the width
+of the saturated band, so it is a switch rather than an assumption.
+
+The curve itself is the NIST Chemistry WebBook's saturation table for nitrous
+oxide (SRD 69, which evaluates the Lemmon & Span 2006 equation of state), read
+off at 1 K steps from the triple point to the critical point and reproduced
+verbatim in `src/n2o.rs` -- no fit of our own sits between the reference data
+and the plot. Interpolation between rows is linear in `ln P`, which is what
+the Clausius-Clapeyron relation says the curve nearly is.
+
 ## CAN decoding
 
 A `.tlog` carries forwarded bus traffic as `CAN_FRAME` messages: an
@@ -285,4 +339,9 @@ from a real log.
   nothing else in the app is either.
 - The two value axes share their grid lines: the right-hand axis is the
   left-hand one relabelled, so its ticks land on the left axis' round
-  numbers rather than its own.
+  numbers rather than its own. Lining them up at zero can leave one axis with
+  a lot of empty space -- that is the cost of the alignment, not a bug.
+- The N₂O pane pairs its two series by interpolating the sparser one onto the
+  denser one's timestamps, and drops samples outside the other series' own
+  time range rather than holding its first or last value. It covers nitrous
+  oxide only; the curve is a property of the fluid, not a setting.

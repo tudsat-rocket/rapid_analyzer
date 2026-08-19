@@ -100,6 +100,19 @@ impl Timeline {
         }
     }
 
+    /// Adopts the x range a plot pane came back with -- a pan, a scroll zoom
+    /// or a box selection -- and a click on it as a seek. Every pane on the
+    /// time axis goes through this, which is what keeps them in step.
+    pub fn follow_plot(&mut self, x0: f64, x1: f64, clicked: Option<f64>, bounds: Option<(f64, f64)>) {
+        if (x0 - self.view_start).abs() > 1e-6 || (x1 - self.view_end).abs() > 1e-6 {
+            self.set_view(x0, x1);
+        }
+        if let Some(t) = clicked {
+            self.seek(t, bounds);
+            self.playing = false;
+        }
+    }
+
     /// Pulls the window and the playhead back inside `bounds`, for when a
     /// source is removed and the timeline shrinks out from under them.
     pub fn clamp_to(&mut self, bounds: Option<(f64, f64)>) {

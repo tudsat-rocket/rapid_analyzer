@@ -11,6 +11,7 @@ use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
 use crate::panes::{AudioPlayerSlot, Pane, PlotAxis, PlotId, Plots, TreeBehavior};
 use crate::timeline::{self, Timeline};
+use crate::vapor::Vapors;
 use crate::video_worker::VideoWorker;
 
 struct ImportOutcome {
@@ -28,11 +29,13 @@ enum PendingAction {
     HideSeries(SourceId, String),
     RemoveSource(SourceId),
     OpenCanBuilder(SourceId),
+    NewVaporPane,
 }
 
 pub struct App {
     project: Project,
     plots: Plots,
+    vapors: Vapors,
     tree: egui_tiles::Tree<Pane>,
     pane_tiles: HashMap<Pane, TileId>,
     timeline: Timeline,
@@ -56,6 +59,7 @@ impl App {
         let mut app = Self {
             project: Project::new(),
             plots: Plots::default(),
+            vapors: Vapors::default(),
             tree: egui_tiles::Tree::empty("root"),
             pane_tiles: HashMap::new(),
             timeline: Timeline::new((0.0, 1.0)),
@@ -167,8 +171,10 @@ impl App {
             }
             self.tree.tiles.remove(tile_id);
         }
-        if let Pane::Plot(id) = pane {
-            self.plots.close(*id);
+        match pane {
+            Pane::Plot(id) => self.plots.close(*id),
+            Pane::Vapor(id) => self.vapors.close(*id),
+            _ => {}
         }
     }
 
@@ -191,6 +197,10 @@ impl App {
                 }
             }
             PendingAction::RemoveSource(source) => self.remove_source(source),
+            PendingAction::NewVaporPane => {
+                let id = self.vapors.create(&self.project);
+                self.add_pane(Pane::Vapor(id));
+            }
             PendingAction::OpenCanBuilder(source) => {
                 if let Some(SourceKind::Log(log)) = self.project.source(source).map(|s| &s.kind) {
                     self.can_builder = Some(CanBuilder::new(source, &log.can));
@@ -263,6 +273,9 @@ impl App {
         for plot in self.plots.remove_source(id) {
             self.remove_pane(&Pane::Plot(plot));
         }
+        // A phase pane outlives the log it was pointed at: the curve is still
+        // worth looking at, and it can be pointed at another one.
+        self.vapors.forget_source(id);
         self.video_workers.remove(&id);
         self.audio_players.remove(&id);
 
@@ -291,6 +304,19 @@ impl App {
                 ui.spinner();
             }
         });
+        // Applied after the borrow of `self.project` below is over.
+        let mut new_vapor_pane = false;
+        // Offered even with nothing imported: the vapour pressure curve is
+        // worth looking at on its own.
+        if ui
+            .button("＋ N₂O phase plot")
+            .on_hover_text(
+                "The nitrous oxide vapour pressure curve, and where a temperature/pressure pair sits against it",
+            )
+            .clicked()
+        {
+            new_vapor_pane = true;
+        }
         if !self.ffmpeg_available {
             ui.colored_label(egui::Color32::YELLOW, "⚠ ffmpeg not found -- video/audio import will fail");
         }
@@ -299,6 +325,9 @@ impl App {
         }
         ui.separator();
 
+        if new_vapor_pane {
+            self.apply(PendingAction::NewVaporPane);
+        }
         if self.project.sources.is_empty() {
             ui.weak("No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file.");
             return;
@@ -317,34 +346,18 @@ impl App {
         let filter = self.series_filter.to_lowercase();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // Nothing in this panel may size itself by its text: egui gives a
+            // panel the width its contents ask for, so one long series name
+            // (or file name) would hand the sidebar half the window and keep
+            // it there. Everything truncates; the source name, which is a
+            // thing the user picked and wants to read, wraps instead.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+
             let sources = &mut self.project.sources;
             let pane_tiles = &self.pane_tiles;
             let plots = &self.plots;
             for source in sources.iter_mut() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut source.enabled, "");
-                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(rect, 2.0, source.color);
-                    ui.strong(&source.name).on_hover_text(source.path.display().to_string());
-                    let kind_tag = match &source.kind {
-                        SourceKind::Log(log) => match log.format {
-                            crate::model::LogFormat::Tlog => "tlog",
-                            crate::model::LogFormat::SqliteLog => "sqlite",
-                        },
-                        SourceKind::Video(_) => "video",
-                        SourceKind::Audio(_) => "audio",
-                    };
-                    ui.weak(format!("[{kind_tag}]"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .small_button("✖")
-                            .on_hover_text("Unload this source, and close every graph and panel showing it")
-                            .clicked()
-                        {
-                            pending.push(PendingAction::RemoveSource(source.id));
-                        }
-                    });
-                });
+                source_header(ui, source, &mut pending);
                 ui.horizontal(|ui| {
                     ui.add_space(18.0);
                     ui.label("offset");
@@ -487,6 +500,45 @@ fn next_speed(current: f32, direction: i32) -> f32 {
         .position(|s| (s - current).abs() < 1e-6)
         .unwrap_or(speeds.len() / 2) as i32;
     speeds[(index + direction).clamp(0, speeds.len() as i32 - 1) as usize]
+}
+
+/// The header row for one source: enable, colour, name, kind, unload.
+///
+/// The name is the one thing in the sidebar that is arbitrarily long, so the
+/// trailing controls are laid out first (right to left) and the name wraps
+/// into whatever width is left over. Laying it out the other way round would
+/// let a long file name push the panel wider than the window.
+fn source_header(ui: &mut egui::Ui, source: &mut Source, pending: &mut Vec<PendingAction>) {
+    let kind_tag = match &source.kind {
+        SourceKind::Log(log) => match log.format {
+            crate::model::LogFormat::Tlog => "tlog",
+            crate::model::LogFormat::SqliteLog => "sqlite",
+        },
+        SourceKind::Video(_) => "video",
+        SourceKind::Audio(_) => "audio",
+    };
+
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut source.enabled, "")
+            .on_hover_text("Show this source in the graphs and panels");
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, source.color);
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("✖")
+                .on_hover_text("Unload this source, and close every graph and panel showing it")
+                .clicked()
+            {
+                pending.push(PendingAction::RemoveSource(source.id));
+            }
+            ui.weak(format!("[{kind_tag}]"));
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&source.name).strong()).wrap())
+                    .on_hover_text(source.path.display().to_string());
+            });
+        });
+    });
 }
 
 /// The series list for one log source, grouped by message so a few hundred
@@ -666,6 +718,7 @@ impl eframe::App for App {
             let mut behavior = TreeBehavior {
                 project: &mut self.project,
                 plots: &mut self.plots,
+                vapors: &mut self.vapors,
                 timeline: &mut self.timeline,
                 video_workers: &mut self.video_workers,
                 audio_players: &mut self.audio_players,
@@ -677,5 +730,71 @@ impl eframe::App for App {
         for pane in closed {
             self.remove_pane(&pane);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{LogFormat, LogSource};
+
+    fn log_source(name: &str) -> Source {
+        Source {
+            id: 0,
+            name: name.to_string(),
+            path: name.into(),
+            offset_seconds: 0.0,
+            color: egui::Color32::WHITE,
+            enabled: true,
+            kind: SourceKind::Log(LogSource {
+                series: Vec::new(),
+                format: LogFormat::Tlog,
+                can: Default::default(),
+            }),
+        }
+    }
+
+    /// Lays out one source header inside a panel `width` wide, and reports the
+    /// size it asked for.
+    fn header_size(name: &str, width: f32) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        let mut source = log_source(name);
+        let mut pending = Vec::new();
+        let mut size = egui::Vec2::ZERO;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            let rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(width, 800.0));
+            let scope = ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                source_header(ui, &mut source, &mut pending);
+            });
+            size = scope.response.rect.size();
+        })
+        .drop_without_applying_deltas();
+        size
+    }
+
+    /// egui hands a panel the width its contents ask for, so a source name
+    /// that refuses to wrap makes the sidebar as wide as the longest file name
+    /// anyone ever imported -- and it stays that way, because the size is
+    /// persisted.
+    #[test]
+    fn a_long_source_name_wraps_instead_of_widening_the_sidebar() {
+        const WIDTH: f32 = 320.0;
+        let short = header_size("run.tlog", WIDTH);
+        let long = header_size(
+            "2026-08-08T17-41-58Z_static-fire-04_oxidizer-tank-and-chamber-instrumentation_recovered-from-the-backup-logger.tlog",
+            WIDTH,
+        );
+        assert!(long.x <= WIDTH + 1.0, "the long name asked for {} px of a {WIDTH} px panel", long.x);
+        assert!(
+            long.y > short.y,
+            "the long name should have wrapped onto more lines ({} vs {})",
+            long.y,
+            short.y
+        );
     }
 }

@@ -18,6 +18,7 @@ use rapid_analyzer::model::{LogFormat, LogSource, Project, Source, SourceKind};
 use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior};
 use rapid_analyzer::series::TimeSeries;
 use rapid_analyzer::timeline::Timeline;
+use rapid_analyzer::vapor::{VaporMode, Vapors};
 
 /// A log source with two series on wildly different scales: a pressure in
 /// bar, and a thrust in newtons that would flatten it on a shared axis.
@@ -89,12 +90,23 @@ fn draw_on(ctx: &egui::Context, contents: impl FnMut(&mut egui::Ui)) {
 
 /// Draws `pane` once; the assertion is that it did not panic.
 fn draw_pane(project: &mut Project, plots: &mut Plots, timeline: &mut Timeline, pane: Pane) {
+    draw_pane_with(project, plots, &mut Vapors::default(), timeline, pane);
+}
+
+fn draw_pane_with(
+    project: &mut Project,
+    plots: &mut Plots,
+    vapors: &mut Vapors,
+    timeline: &mut Timeline,
+    pane: Pane,
+) {
     let mut video_workers = HashMap::new();
     let mut audio_players = HashMap::new();
     draw(|ui| {
         let mut behavior = TreeBehavior {
             project,
             plots,
+            vapors,
             timeline,
             video_workers: &mut video_workers,
             audio_players: &mut audio_players,
@@ -102,6 +114,49 @@ fn draw_pane(project: &mut Project, plots: &mut Plots, timeline: &mut Timeline, 
         };
         let _ = behavior.pane_ui(ui, TileId::from_u64(1), &mut pane.clone());
     });
+}
+
+/// A tank of nitrous whose pressure is walked down through its own vapour
+/// pressure -- so the run covers liquid, saturated and vapour in turn -- and
+/// which is then warmed past the critical temperature, where the curve stops
+/// existing at all.
+fn project_with_a_nitrous_tank() -> Project {
+    let n = 600;
+    let temperature: Vec<[f64; 2]> = (0..n)
+        .map(|i| {
+            let t = i as f64 * 0.5;
+            let c = if t < 250.0 { 20.0 } else { 20.0 + (t - 250.0) * 0.5 };
+            [t, c]
+        })
+        .collect();
+    let pressure: Vec<[f64; 2]> = (0..n)
+        .map(|i| {
+            let t = i as f64 * 0.5;
+            let bar = if t < 250.0 { 60.0 - t * 0.08 } else { 70.0 };
+            [t, bar]
+        })
+        .collect();
+
+    let mut project = Project::new();
+    let id = project.alloc_id();
+    project.sources.push(Source {
+        id,
+        name: "tank.tlog".to_string(),
+        path: "tank.tlog".into(),
+        offset_seconds: 0.0,
+        color: egui::Color32::WHITE,
+        enabled: true,
+        kind: SourceKind::Log(LogSource {
+            series: vec![
+                TimeSeries::from_points("PRESSURE_VESSEL[1].pressure1", pressure).with_unit(Some("bar".into())),
+                TimeSeries::from_points("PRESSURE_VESSEL[1].temperature1", temperature)
+                    .with_unit(Some("°C".into())),
+            ],
+            format: LogFormat::Tlog,
+            can: CanFrames::default(),
+        }),
+    });
+    project
 }
 
 #[test]
@@ -218,4 +273,78 @@ fn a_hand_specified_signal_becomes_a_plottable_series() {
     assert_eq!(series.unit.as_deref(), Some("k"));
     assert_eq!(series.value_at(0.0, 0.0), Some(0.0));
     assert!((series.value_at(19.9, 0.0).unwrap() - 0.199).abs() < 1e-9);
+}
+
+#[test]
+fn the_phase_pane_draws_a_run_through_every_zone() {
+    let mut project = project_with_a_nitrous_tank();
+    let mut vapors = Vapors::default();
+    let id = vapors.create(&project);
+
+    // The guess has to find the pair on its own, from the units and the
+    // shared message prefix -- it is what the pane opens with.
+    let spec = vapors.get(id).expect("the pane exists");
+    assert_eq!(
+        spec.temperature.as_ref().map(|r| r.series.as_str()),
+        Some("PRESSURE_VESSEL[1].temperature1")
+    );
+    assert_eq!(
+        spec.pressure.as_ref().map(|r| r.series.as_str()),
+        Some("PRESSURE_VESSEL[1].pressure1")
+    );
+
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 120.0;
+    let mut plots = Plots::default();
+    draw_pane_with(&mut project, &mut plots, &mut vapors, &mut timeline, Pane::Vapor(id));
+
+    // ... and the same data on the curve itself.
+    vapors.get_mut(id).unwrap().mode = VaporMode::Curve;
+    draw_pane_with(&mut project, &mut plots, &mut vapors, &mut timeline, Pane::Vapor(id));
+}
+
+#[test]
+fn the_phase_pane_draws_the_bare_curve_with_nothing_selected() {
+    let mut project = Project::new();
+    let mut vapors = Vapors::default();
+    let id = vapors.create(&project);
+    {
+        let spec = vapors.get(id).unwrap();
+        assert!(spec.temperature.is_none() && spec.pressure.is_none());
+        // With nothing to compare against the curve, the curve itself is what
+        // the pane opens on.
+        assert_eq!(spec.mode, VaporMode::Curve);
+    }
+    let mut timeline = Timeline::new((0.0, 1.0));
+    let mut plots = Plots::default();
+    draw_pane_with(&mut project, &mut plots, &mut vapors, &mut timeline, Pane::Vapor(id));
+
+    // The state plot has nothing to say without series, and must say so
+    // rather than dividing by an empty range.
+    vapors.get_mut(id).unwrap().mode = VaporMode::State;
+    draw_pane_with(&mut project, &mut plots, &mut vapors, &mut timeline, Pane::Vapor(id));
+}
+
+#[test]
+fn the_phase_pane_survives_a_window_with_no_overlapping_samples() {
+    let mut project = project_with_a_nitrous_tank();
+    let mut vapors = Vapors::default();
+    let id = vapors.create(&project);
+    let mut timeline = Timeline::new((0.0, 300.0));
+    timeline.set_view(1e6, 1e6 + 10.0);
+    let mut plots = Plots::default();
+    draw_pane_with(&mut project, &mut plots, &mut vapors, &mut timeline, Pane::Vapor(id));
+}
+
+#[test]
+fn unloading_a_source_leaves_the_phase_pane_pointing_at_nothing() {
+    let project = project_with_a_nitrous_tank();
+    let source = project.sources[0].id;
+    let mut vapors = Vapors::default();
+    let id = vapors.create(&project);
+    assert!(vapors.get(id).unwrap().uses(source));
+    vapors.forget_source(source);
+    let spec = vapors.get(id).unwrap();
+    assert!(spec.temperature.is_none() && spec.pressure.is_none());
+    assert!(!spec.uses(source));
 }

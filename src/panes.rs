@@ -7,6 +7,7 @@ use crate::audio_playback::AudioPlayback;
 use crate::colors::color_for_index;
 use crate::model::{Project, SourceId, SourceKind};
 use crate::timeline::Timeline;
+use crate::vapor::{VaporId, Vapors};
 use crate::video_worker::VideoWorker;
 
 pub type PlotId = u64;
@@ -16,6 +17,8 @@ pub enum Pane {
     Plot(PlotId),
     Video(SourceId),
     Audio(SourceId),
+    /// The nitrous oxide phase pane -- see [`crate::vapor`].
+    Vapor(VaporId),
 }
 
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0xFF, 0x5C, 0x3D);
@@ -79,6 +82,11 @@ pub struct PlotSpec {
     /// Value range fixed by a box zoom, in left-axis units. `None` means the
     /// range follows whatever is visible.
     pub y_manual: Option<(f64, f64)>,
+    /// Put the two axes' zeros at the same height. Two quantities that share a
+    /// sign convention -- a thrust curve and a chamber pressure both falling
+    /// through their own zero -- are only comparable by eye when "nothing" is
+    /// on the same line for both.
+    pub zero_aligned: bool,
     /// Kept separate from `entries.len()` so removing a series doesn't
     /// recolour the ones that stay.
     color_cursor: usize,
@@ -127,6 +135,7 @@ impl Plots {
             custom_title: String::new(),
             normalize: false,
             y_manual: None,
+            zero_aligned: false,
             color_cursor: 0,
         });
         self.add(id, source, series, PlotAxis::Left);
@@ -245,6 +254,7 @@ pub struct TreeBehavior<'a> {
     pub project: &'a mut Project,
     pub plots: &'a mut Plots,
     pub timeline: &'a mut Timeline,
+    pub vapors: &'a mut Vapors,
     pub video_workers: &'a mut HashMap<SourceId, VideoWorker>,
     pub audio_players: &'a mut HashMap<SourceId, AudioPlayerSlot>,
     /// Panes the user closed from their tab or emptied from the ⚙ menu, for
@@ -326,6 +336,27 @@ fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
         // A flat line still needs an axis to sit in the middle of.
         (v, _) => (v - 1.0, v + 1.0),
     })
+}
+
+/// Expands both axes' ranges until zero sits at the same height on each.
+///
+/// Only ever expands: a range that got smaller would clip the very data the
+/// user is comparing. Where zero ends up is the average of where each axis
+/// would naturally have put it, which splits the unavoidable empty space
+/// between the two rather than dumping it all on one. Both series entirely
+/// above zero therefore push it to the bottom of the graph, not the middle.
+fn align_zero(left: (f64, f64), right: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+    let fraction = |(lo, hi): (f64, f64)| -lo / (hi - lo);
+    // Away from the very edge: zero exactly on the frame is a zero the reader
+    // cannot see, and the expansion needed to reach it grows without bound.
+    let f = ((fraction(left) + fraction(right)) * 0.5).clamp(0.05, 0.95);
+    (place_zero(left, f), place_zero(right, f))
+}
+
+/// The smallest range containing `range` that has zero `f` of the way up it.
+fn place_zero((lo, hi): (f64, f64), f: f64) -> (f64, f64) {
+    let span = f64::max(hi / (1.0 - f), -lo / f).max(f64::MIN_POSITIVE);
+    (-f * span, (1.0 - f) * span)
 }
 
 /// Tick label for a value axis whose numbers we relabel ourselves, matching
@@ -418,6 +449,10 @@ impl<'a> TreeBehavior<'a> {
                     );
                     ui.checkbox(&mut plot.normalize, "Normalize each series to 0..1")
                         .on_hover_text("Compare shapes when the series don't share a scale");
+                    if plot.entries.iter().any(|e| e.axis == PlotAxis::Right) {
+                        ui.checkbox(&mut plot.zero_aligned, "Line up both axes at zero")
+                            .on_hover_text("Put the left and right axis' zero at the same height");
+                    }
                     if plot.y_manual.is_some() && ui.button("⟲ Auto value range").clicked() {
                         plot.y_manual = None;
                     }
@@ -485,8 +520,15 @@ impl<'a> TreeBehavior<'a> {
                     .filter_map(|s| s.bounds),
             )
         };
-        let left_range = range_of(PlotAxis::Left);
-        let right_range = range_of(PlotAxis::Right);
+        let mut left_range = range_of(PlotAxis::Left);
+        let mut right_range = range_of(PlotAxis::Right);
+        if plot.zero_aligned
+            && let (Some(left), Some(right)) = (left_range, right_range)
+        {
+            let (left, right) = align_zero(left, right);
+            left_range = Some(left);
+            right_range = Some(right);
+        }
 
         // With nothing on the left, right-axis series keep their own numbers
         // rather than being mapped into a range that isn't there.
@@ -600,6 +642,16 @@ impl<'a> TreeBehavior<'a> {
             && let Some(plot) = self.plots.get_mut(plot_id) {
                 plot.y_manual = Some(range);
             }
+    }
+
+    fn vapor_pane(&mut self, ui: &mut egui::Ui, id: VaporId) {
+        let Some(vapor) = self.vapors.get_mut(id) else {
+            ui.colored_label(Color32::RED, "this phase pane no longer exists");
+            return;
+        };
+        if vapor.ui(ui, self.project, self.timeline) {
+            self.closed.push(Pane::Vapor(id));
+        }
     }
 
     fn video_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
@@ -768,14 +820,9 @@ impl<'a> TreeBehavior<'a> {
         clicked_time: Option<f64>,
     ) -> Option<(f64, f64)> {
         let bounds = transform.bounds();
-        let (nx0, nx1) = (bounds.min()[0], bounds.max()[0]);
-        if (nx0 - self.timeline.view_start).abs() > 1e-6 || (nx1 - self.timeline.view_end).abs() > 1e-6 {
-            self.timeline.set_view(nx0, nx1);
-        }
-        if let Some(t) = clicked_time {
-            self.timeline.seek(t, self.project.time_bounds());
-            self.timeline.playing = false;
-        }
+        let project_bounds = self.project.time_bounds();
+        self.timeline
+            .follow_plot(bounds.min()[0], bounds.max()[0], clicked_time, project_bounds);
 
         let (ny0, ny1) = (bounds.min()[1], bounds.max()[1]);
         let tolerance = (expected_y.1 - expected_y.0).abs() * 1e-6;
@@ -799,6 +846,17 @@ impl<'a> TreeBehavior<'a> {
     }
 }
 
+/// A tab is a few centimetres wide; a file name can be a paragraph. The full
+/// name is one hover away in the source list.
+fn short_title(name: &str) -> String {
+    const MAX: usize = 24;
+    let count = name.chars().count();
+    if count <= MAX {
+        return name.to_string();
+    }
+    format!("{}…", name.chars().take(MAX - 1).collect::<String>())
+}
+
 /// Legend labels repeat the message prefix on every line; the playhead
 /// readout is tighter with just the field.
 fn short_label(label: &str) -> &str {
@@ -812,8 +870,12 @@ impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
                 Some(plot) => plot.title().into(),
                 None => "plot".into(),
             },
-            Pane::Video(id) => format!("🎬 {}", self.source_name(*id)).into(),
-            Pane::Audio(id) => format!("🔊 {}", self.source_name(*id)).into(),
+            Pane::Video(id) => format!("🎬 {}", short_title(&self.source_name(*id))).into(),
+            Pane::Audio(id) => format!("🔊 {}", short_title(&self.source_name(*id))).into(),
+            Pane::Vapor(id) => match self.vapors.get(*id) {
+                Some(vapor) => vapor.title().into(),
+                None => "N₂O".into(),
+            },
         }
     }
 
@@ -835,6 +897,7 @@ impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
             Pane::Plot(id) => self.plot_pane(ui, id),
             Pane::Video(id) => self.video_pane(ui, id),
             Pane::Audio(id) => self.audio_pane(ui, id),
+            Pane::Vapor(id) => self.vapor_pane(ui, id),
         }
         egui_tiles::UiResponse::None
     }
@@ -935,6 +998,34 @@ mod tests {
         assert_eq!(axis_range([(0.0, 10.0), (-5.0, 1.0)].into_iter()), Some((-6.5, 11.5)));
         assert_eq!(axis_range([(3.0, 3.0)].into_iter()), Some((2.0, 4.0)));
         assert_eq!(axis_range(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn aligning_at_zero_puts_both_zeros_at_the_same_height() {
+        // A pressure that never leaves 35..55 bar next to a thrust curve that
+        // starts and ends at nothing.
+        let (left, right) = align_zero((35.0, 55.0), (0.0, 8000.0));
+        let height = |(lo, hi): (f64, f64)| -lo / (hi - lo);
+        assert!((height(left) - height(right)).abs() < 1e-9);
+        // Neither range may lose any of the data it was covering.
+        assert!(left.0 <= 35.0 && left.1 >= 55.0, "{left:?}");
+        assert!(right.0 <= 0.0 && right.1 >= 8000.0, "{right:?}");
+    }
+
+    #[test]
+    fn aligning_at_zero_works_for_ranges_that_straddle_it() {
+        let (left, right) = align_zero((-10.0, 10.0), (-8000.0, 2000.0));
+        let height = |(lo, hi): (f64, f64)| -lo / (hi - lo);
+        assert!((height(left) - height(right)).abs() < 1e-9);
+        assert!(left.0 <= -10.0 && left.1 >= 10.0, "{left:?}");
+        assert!(right.0 <= -8000.0 && right.1 >= 2000.0, "{right:?}");
+
+        // ... and for two ranges that are entirely negative, where zero ends
+        // up near the top rather than the middle.
+        let (left, right) = align_zero((-100.0, -20.0), (-4.0, -1.0));
+        assert!((height(left) - height(right)).abs() < 1e-9);
+        assert!(height(left) > 0.5, "zero should sit high up, was at {}", height(left));
+        assert!(left.0 <= -100.0 && left.1 >= -20.0, "{left:?}");
     }
 
     #[test]
