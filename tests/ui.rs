@@ -17,6 +17,7 @@ use rapid_analyzer::can_builder::CanBuilder;
 use rapid_analyzer::model::{LogFormat, LogSource, Project, Source, SourceKind};
 use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior};
 use rapid_analyzer::series::TimeSeries;
+use rapid_analyzer::tank::{TANK_SENSORS, Tanks};
 use rapid_analyzer::timeline::Timeline;
 use rapid_analyzer::vapor::{VaporMode, Vapors};
 
@@ -100,6 +101,21 @@ fn draw_pane_with(
     timeline: &mut Timeline,
     pane: Pane,
 ) {
+    draw_pane_full(project, plots, vapors, &mut Tanks::default(), timeline, pane);
+}
+
+fn draw_tank_pane(project: &mut Project, tanks: &mut Tanks, timeline: &mut Timeline, pane: Pane) {
+    draw_pane_full(project, &mut Plots::default(), &mut Vapors::default(), tanks, timeline, pane);
+}
+
+fn draw_pane_full(
+    project: &mut Project,
+    plots: &mut Plots,
+    vapors: &mut Vapors,
+    tanks: &mut Tanks,
+    timeline: &mut Timeline,
+    pane: Pane,
+) {
     let mut video_workers = HashMap::new();
     let mut audio_players = HashMap::new();
     draw(|ui| {
@@ -107,6 +123,7 @@ fn draw_pane_with(
             project,
             plots,
             vapors,
+            tanks,
             timeline,
             video_workers: &mut video_workers,
             audio_players: &mut audio_players,
@@ -347,4 +364,167 @@ fn unloading_a_source_leaves_the_phase_pane_pointing_at_nothing() {
     let spec = vapors.get(id).unwrap();
     assert!(spec.temperature.is_none() && spec.pressure.is_none());
     assert!(!spec.uses(source));
+}
+
+/// A tank whose wall is ten sensors off one IO board, stratified: cold liquid
+/// at the bottom, warm ullage at the top, with the whole column warming over
+/// the run and the top sensor going supercritical at the end of it. Sensor 4
+/// is dead -- a disconnected probe is the normal case, not the exotic one --
+/// and sensor 7 drops out half way through.
+fn project_with_a_tank_wall() -> Project {
+    let n = 400;
+    let mut series: Vec<TimeSeries> = Vec::new();
+    for sensor in 0..TANK_SENSORS {
+        if sensor == 4 {
+            continue;
+        }
+        let points: Vec<[f64; 2]> = (0..n)
+            .map(|i| i as f64 * 0.5)
+            .filter(|t| !(sensor == 7 && *t > 100.0))
+            .map(|t| [t, -15.0 + sensor as f64 * 6.0 + t * 0.02])
+            .collect();
+        series.push(
+            TimeSeries::from_points(format!("CAN_SENSOR[6].slot{sensor}"), points).with_unit(Some("°C".into())),
+        );
+    }
+    series.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut project = Project::new();
+    let id = project.alloc_id();
+    project.sources.push(Source {
+        id,
+        name: "tank.tlog".to_string(),
+        path: "tank.tlog".into(),
+        offset_seconds: 0.0,
+        color: egui::Color32::WHITE,
+        enabled: true,
+        kind: SourceKind::Log(LogSource {
+            series,
+            format: LogFormat::Tlog,
+            can: CanFrames::default(),
+        }),
+    });
+    project
+}
+
+#[test]
+fn the_tank_pane_draws_a_stratified_wall() {
+    let mut project = project_with_a_tank_wall();
+    let mut tanks = Tanks::default();
+    let id = tanks.create(&project);
+
+    // The row has to be found on its own -- it is what the pane opens with.
+    let spec = tanks.get(id).expect("the pane exists");
+    assert_eq!(spec.picked(), TANK_SENSORS - 1, "the dead probe stays blank");
+    assert_eq!(spec.sensors[4], None);
+    assert_eq!(spec.title(), "Tank · CAN_SENSOR[6].slot");
+
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 120.0;
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(id));
+
+    // ... and with the interpolation dropped, which is a different mesh.
+    tanks.get_mut(id).unwrap().blocks = true;
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(id));
+
+    // ... and with the by-hand pickers open over every series in the project.
+    tanks.get_mut(id).unwrap().open_sensor_pickers();
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(id));
+}
+
+/// Nothing picked, nothing loaded, and a window the log does not reach: each
+/// of these is an empty range something downstream divides by.
+#[test]
+fn the_tank_pane_draws_with_nothing_to_show() {
+    let mut project = Project::new();
+    let mut tanks = Tanks::default();
+    let id = tanks.create(&project);
+    assert_eq!(tanks.get(id).unwrap().picked(), 0);
+    let mut timeline = Timeline::new((0.0, 1.0));
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(id));
+
+    let mut project = project_with_a_tank_wall();
+    let mut tanks = Tanks::default();
+    let id = tanks.create(&project);
+    let mut timeline = Timeline::new((0.0, 200.0));
+    timeline.set_view(1e6, 1e6 + 10.0);
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(id));
+}
+
+/// The painter arrives at every rect by subtracting fixed gutters from
+/// whatever the pane is, so a narrow pane is where a width goes negative and a
+/// `cols - 1` divides by zero -- a panic in a layout closure, not a cosmetic
+/// problem.
+#[test]
+fn the_tank_pane_survives_every_pane_size() {
+    let mut project = project_with_a_tank_wall();
+    let mut tanks = Tanks::default();
+    let id = tanks.create(&project);
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 120.0;
+
+    for size in [
+        egui::vec2(1400.0, 900.0),
+        egui::vec2(560.0, 380.0),
+        egui::vec2(200.0, 120.0),
+        egui::vec2(60.0, 400.0),
+        egui::vec2(400.0, 40.0),
+    ] {
+        for blocks in [false, true] {
+            tanks.get_mut(id).unwrap().blocks = blocks;
+            let ctx = egui::Context::default();
+            let mut video_workers = HashMap::new();
+            let mut audio_players = HashMap::new();
+            let raw = RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), size)),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                let mut behavior = TreeBehavior {
+                    project: &mut project,
+                    plots: &mut Plots::default(),
+                    vapors: &mut Vapors::default(),
+                    tanks: &mut tanks,
+                    timeline: &mut timeline,
+                    video_workers: &mut video_workers,
+                    audio_players: &mut audio_players,
+                    closed: Vec::new(),
+                };
+                let _ = behavior.pane_ui(ui, TileId::from_u64(1), &mut Pane::Tank(id));
+            })
+            .drop_without_applying_deltas();
+        }
+    }
+}
+
+/// Two tank panes side by side must not share widget ids -- the pickers, the
+/// unit combo and the scroll area are all per-pane.
+#[test]
+fn two_tank_panes_do_not_collide() {
+    let mut project = project_with_a_tank_wall();
+    let mut tanks = Tanks::default();
+    let first = tanks.create(&project);
+    let second = tanks.create(&project);
+    tanks.get_mut(first).unwrap().open_sensor_pickers();
+    tanks.get_mut(second).unwrap().open_sensor_pickers();
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+
+    let ctx = egui::Context::default();
+    let mut video_workers = HashMap::new();
+    let mut audio_players = HashMap::new();
+    draw_on(&ctx, |ui| {
+        for pane in [Pane::Tank(first), Pane::Tank(second)] {
+            let mut behavior = TreeBehavior {
+                project: &mut project,
+                plots: &mut Plots::default(),
+                vapors: &mut Vapors::default(),
+                tanks: &mut tanks,
+                timeline: &mut timeline,
+                video_workers: &mut video_workers,
+                audio_players: &mut audio_players,
+                closed: Vec::new(),
+            };
+            let _ = behavior.pane_ui(ui, TileId::from_u64(1), &mut pane.clone());
+        }
+    });
 }

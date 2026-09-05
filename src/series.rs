@@ -111,6 +111,19 @@ impl TimeSeries {
         }
     }
 
+    /// The last raw sample at or before `t_master`, if there is one.
+    ///
+    /// Unlike [`Self::value_at`] this neither interpolates nor clamps to the
+    /// ends: it answers "what had this series last said", which is what a
+    /// readout that must not invent a value across a dropout -- or before the
+    /// series starts -- needs.
+    pub fn last_at_or_before(&self, t_master: f64, offset: f64) -> Option<[f64; 2]> {
+        let t = t_master - offset;
+        let idx = self.raw.partition_point(|p| p[0] <= t);
+        let point = self.raw.get(idx.checked_sub(1)?)?;
+        Some([point[0] + offset, point[1]])
+    }
+
     /// Linear interpolation of the value at a specific master-timeline instant.
     pub fn value_at(&self, t_master: f64, offset: f64) -> Option<f64> {
         let t = t_master - offset;
@@ -202,6 +215,19 @@ mod tests {
         let sliced = ts.slice_for_range(0.0, 10_000.0, 0.0, 2000);
         assert!(sliced.len() < 20_000, "expected decimation, got {}", sliced.len());
         assert!(!sliced.is_empty());
+    }
+
+    #[test]
+    fn the_last_sample_is_the_one_before_the_instant_asked_about() {
+        let ts = TimeSeries::from_points("x", vec![[1.0, 10.0], [2.0, 20.0], [5.0, 50.0]]);
+        assert_eq!(ts.last_at_or_before(2.0, 0.0), Some([2.0, 20.0]));
+        // No interpolation, and no reaching forward to the next one.
+        assert_eq!(ts.last_at_or_before(4.9, 0.0), Some([2.0, 20.0]));
+        // Before the series starts there is nothing to report -- `value_at`
+        // would clamp to the first sample, which is the thing a tank readout
+        // must not do.
+        assert_eq!(ts.last_at_or_before(0.5, 0.0), None);
+        assert_eq!(ts.last_at_or_before(11.0, 10.0), Some([11.0, 10.0]));
     }
 
     #[test]

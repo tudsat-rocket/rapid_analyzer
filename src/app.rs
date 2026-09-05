@@ -10,6 +10,7 @@ use crate::colors::color_for_index;
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
 use crate::panes::{AudioPlayerSlot, Pane, PlotAxis, PlotId, Plots, TreeBehavior};
+use crate::tank::Tanks;
 use crate::timeline::{self, Timeline};
 use crate::vapor::Vapors;
 use crate::video_worker::VideoWorker;
@@ -30,12 +31,14 @@ enum PendingAction {
     RemoveSource(SourceId),
     OpenCanBuilder(SourceId),
     NewVaporPane,
+    NewTankPane,
 }
 
 pub struct App {
     project: Project,
     plots: Plots,
     vapors: Vapors,
+    tanks: Tanks,
     tree: egui_tiles::Tree<Pane>,
     pane_tiles: HashMap<Pane, TileId>,
     timeline: Timeline,
@@ -60,6 +63,7 @@ impl App {
             project: Project::new(),
             plots: Plots::default(),
             vapors: Vapors::default(),
+            tanks: Tanks::default(),
             tree: egui_tiles::Tree::empty("root"),
             pane_tiles: HashMap::new(),
             timeline: Timeline::new((0.0, 1.0)),
@@ -174,6 +178,7 @@ impl App {
         match pane {
             Pane::Plot(id) => self.plots.close(*id),
             Pane::Vapor(id) => self.vapors.close(*id),
+            Pane::Tank(id) => self.tanks.close(*id),
             _ => {}
         }
     }
@@ -200,6 +205,10 @@ impl App {
             PendingAction::NewVaporPane => {
                 let id = self.vapors.create(&self.project);
                 self.add_pane(Pane::Vapor(id));
+            }
+            PendingAction::NewTankPane => {
+                let id = self.tanks.create(&self.project);
+                self.add_pane(Pane::Tank(id));
             }
             PendingAction::OpenCanBuilder(source) => {
                 if let Some(SourceKind::Log(log)) = self.project.source(source).map(|s| &s.kind) {
@@ -276,6 +285,9 @@ impl App {
         // A phase pane outlives the log it was pointed at: the curve is still
         // worth looking at, and it can be pointed at another one.
         self.vapors.forget_source(id);
+        // Same for the tank pane: the wall it was drawing is gone, the pane
+        // and its scale are not.
+        self.tanks.forget_source(id);
         self.video_workers.remove(&id);
         self.audio_players.remove(&id);
 
@@ -306,6 +318,7 @@ impl App {
         });
         // Applied after the borrow of `self.project` below is over.
         let mut new_vapor_pane = false;
+        let mut new_tank_pane = false;
         // Offered even with nothing imported: the vapour pressure curve is
         // worth looking at on its own.
         if ui
@@ -317,6 +330,15 @@ impl App {
         {
             new_vapor_pane = true;
         }
+        if ui
+            .button("＋ Tank level")
+            .on_hover_text(
+                "The tank wall as a picture: ten temperatures up the cylinder, colour against height and time",
+            )
+            .clicked()
+        {
+            new_tank_pane = true;
+        }
         if !self.ffmpeg_available {
             ui.colored_label(egui::Color32::YELLOW, "⚠ ffmpeg not found -- video/audio import will fail");
         }
@@ -327,6 +349,9 @@ impl App {
 
         if new_vapor_pane {
             self.apply(PendingAction::NewVaporPane);
+        }
+        if new_tank_pane {
+            self.apply(PendingAction::NewTankPane);
         }
         if self.project.sources.is_empty() {
             ui.weak("No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file.");
@@ -719,6 +744,7 @@ impl eframe::App for App {
                 project: &mut self.project,
                 plots: &mut self.plots,
                 vapors: &mut self.vapors,
+                tanks: &mut self.tanks,
                 timeline: &mut self.timeline,
                 video_workers: &mut self.video_workers,
                 audio_players: &mut self.audio_players,

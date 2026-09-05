@@ -10,6 +10,7 @@ pub mod model;
 pub mod n2o;
 pub mod panes;
 pub mod series;
+pub mod tank;
 pub mod timeline;
 pub mod vapor;
 pub mod video_worker;

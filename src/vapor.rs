@@ -947,7 +947,7 @@ fn unit_combo<T: Copy + PartialEq>(
 /// A combo box would be hopeless here -- a tlog carries hundreds of series --
 /// so it is a filter box over a list, with the series that look like the
 /// quantity being asked for floated to the top.
-fn series_picker(
+pub(crate) fn series_picker(
     ui: &mut egui::Ui,
     id: &str,
     project: &Project,

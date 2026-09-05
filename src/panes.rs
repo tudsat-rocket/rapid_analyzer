@@ -6,6 +6,7 @@ use egui_plot::{AxisHints, Corner, HPlacement, Legend, Line, Plot, PlotBounds, P
 use crate::audio_playback::AudioPlayback;
 use crate::colors::color_for_index;
 use crate::model::{Project, SourceId, SourceKind};
+use crate::tank::{TankId, Tanks};
 use crate::timeline::Timeline;
 use crate::vapor::{VaporId, Vapors};
 use crate::video_worker::VideoWorker;
@@ -19,6 +20,8 @@ pub enum Pane {
     Audio(SourceId),
     /// The nitrous oxide phase pane -- see [`crate::vapor`].
     Vapor(VaporId),
+    /// The tank wall as a picture -- see [`crate::tank`].
+    Tank(TankId),
 }
 
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0xFF, 0x5C, 0x3D);
@@ -255,6 +258,7 @@ pub struct TreeBehavior<'a> {
     pub plots: &'a mut Plots,
     pub timeline: &'a mut Timeline,
     pub vapors: &'a mut Vapors,
+    pub tanks: &'a mut Tanks,
     pub video_workers: &'a mut HashMap<SourceId, VideoWorker>,
     pub audio_players: &'a mut HashMap<SourceId, AudioPlayerSlot>,
     /// Panes the user closed from their tab or emptied from the ⚙ menu, for
@@ -654,6 +658,16 @@ impl<'a> TreeBehavior<'a> {
         }
     }
 
+    fn tank_pane(&mut self, ui: &mut egui::Ui, id: TankId) {
+        let Some(tank) = self.tanks.get_mut(id) else {
+            ui.colored_label(Color32::RED, "this tank pane no longer exists");
+            return;
+        };
+        if tank.ui(ui, self.project, self.timeline) {
+            self.closed.push(Pane::Tank(id));
+        }
+    }
+
     fn video_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
         let Some(source) = self.project.source(source_id) else {
             ui.colored_label(Color32::RED, "source no longer loaded");
@@ -876,6 +890,10 @@ impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
                 Some(vapor) => vapor.title().into(),
                 None => "N₂O".into(),
             },
+            Pane::Tank(id) => match self.tanks.get(*id) {
+                Some(tank) => tank.title().into(),
+                None => "tank".into(),
+            },
         }
     }
 
@@ -898,6 +916,7 @@ impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
             Pane::Video(id) => self.video_pane(ui, id),
             Pane::Audio(id) => self.audio_pane(ui, id),
             Pane::Vapor(id) => self.vapor_pane(ui, id),
+            Pane::Tank(id) => self.tank_pane(ui, id),
         }
         egui_tiles::UiResponse::None
     }

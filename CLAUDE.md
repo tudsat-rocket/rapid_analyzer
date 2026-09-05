@@ -105,6 +105,38 @@ and are therefore pinned by tests:
 - **Gaps.** Above the critical temperature there is no saturation state, so
   the trace and its zones break into runs rather than being drawn through.
 
+### Tank level
+
+`src/tank.rs` is a port of `rapid-scope`'s live tank window (`../rapid-scope`,
+`src/ui/tank.rs`) with its clock swapped: there the strip's right edge is *now* and
+scrolls, here the horizontal axis is the master timeline, so the pane shows the same
+window as every graph and the playhead is a line through the picture. Ten temperatures
+become a mesh -- height up the screen, temperature as colour, time across -- so
+stratification is one picture instead of ten graphs. Things that are easy to get wrong
+and are therefore pinned by tests:
+
+- **Which series.** `sensor_groups` finds runs that differ only by a trailing number
+  (`CAN_SENSOR[10].slot0..slot9`). The number *is* the height, offset so the lowest
+  member is the bottom; a skipped number leaves that height blank rather than packing
+  the rest down into it, which would silently move every sensor above it.
+- **Units.** Everything below `TankSpec::unit` is °C -- the field, the ramp, the
+  readouts, the legend. That setting is what the *series* are in, not a display unit.
+  `SensorUnit::CentiCelsius` is the one that matters in practice: `can/iocan.rs` leaves
+  a slot as `counts` scale 1.0 until its node announces a unit code, and those counts
+  are hundredths of a degree. The example tlog's tank (node 10) is entirely in that
+  state, so guessing has to accept a unitless row -- while still refusing anything
+  declaring pressure.
+- **Gaps.** A column takes the last sample at or before it, and only if it is within
+  the hold; holding across a dropout would paint a tank nobody measured. The hold grows
+  to one column's width when zoomed out, because the LOD slice is coarser than the log
+  there and a fixed hold would hollow the strip out.
+- **Geometry.** `sensor_band` and `column_cell` tile the vessel and the window exactly,
+  which is what blocks mode promises. `layout` refuses a pane too small to draw in
+  rather than letting a width go negative.
+
+Being a painter rather than an `egui_plot`, it gets no gestures for free: `interact`
+writes pan/zoom/seek back into `Timeline` itself.
+
 ### CAN
 
 `src/can/` exists because a CAN frame is a container, not a measurement: the generic tlog path
@@ -146,7 +178,7 @@ drifts >0.3 s from the timeline cursor; a missing output device is cached as `No
 ### UI panes
 
 `egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot(PlotId)`,
-`Video`, `Audio`, `Vapor(VaporId)`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
+`Video`, `Audio`, `Vapor(VaporId)`, `Tank(TankId)`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar
 checkboxes and tab close buttons add/remove panes through it, so both must stay in sync
 (`add_pane`/`remove_pane`). Closures inside `tree.ui` can't reach `App`, so `TreeBehavior` collects
 panes to drop into `closed`, which `App` drains afterwards. Log series start hidden (a tlog can

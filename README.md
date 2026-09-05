@@ -42,6 +42,10 @@ zoomed together.
 - **N₂O phase**: a pane that reads a temperature and a pressure series against
   the nitrous oxide vapour pressure curve and says which side of it the tank
   was on, at every instant -- see "Nitrous oxide phase" below.
+- **Tank level**: the ten temperatures lining a tank wall drawn as the tank --
+  height up the screen, temperature as colour, time across -- so
+  stratification is a picture rather than ten graphs to compare by eye. See
+  "Tank level" below.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
   any graph, adjustable playback speed, and keyboard shortcuts for all of it
   (see below).
@@ -243,6 +247,62 @@ verbatim in `src/n2o.rs` -- no fit of our own sits between the reference data
 and the plot. Interpolation between rows is linear in `ln P`, which is what
 the Clausius-Clapeyron relation says the curve nearly is.
 
+## Tank level
+
+A tank with sensors up its wall is not really ten signals. It is one signal
+with a height axis, and the thing worth seeing is *stratification*: a warm
+layer sitting on cold liquid, or a boil-off front travelling up the wall. Ten
+strip charts stacked on top of each other cannot show that, because the reader
+has to do the comparison between the boxes.
+
+"＋ Tank level" in the sidebar opens a pane that draws the column itself:
+height up the screen, temperature as colour, time to the right. A front moving
+up the tank is a diagonal, a uniform warm-up is a horizontal wash, and a single
+sensor drifting away from its neighbours is a stripe. The time axis is the
+*master* one, so the pane shows the same window as every graph and moves with
+them; drag to pan, scroll to zoom, click to seek, and the playhead is a line
+through the picture with the ten numbers beside it read at that instant.
+
+This is a port of the live tank window in the `rapid-scope` bench tool, minus
+its "now": there the strip scrolls, here it is scrubbed.
+
+- **Picking the wall.** The pane looks for a run of series that differ only by
+  a trailing number -- `CAN_SENSOR[10].slot0` through `slot9` off an IO board,
+  or `tank_temp_1..10` from a sensor log -- and opens on the best one it finds.
+  The number *is* the height, offset so the lowest is the bottom of the tank: a
+  number the row skips is a height left blank, because packing the sensors that
+  did report down into the hole would put every one above it at a height it was
+  never at. The menu in the header lists every row it found, and `⚙` opens the
+  ten heights for picking by hand.
+- **Units.** Everything drawn is °C. The unit control says what the *series*
+  are in, not what to show them as. `c°C` is the case that matters: an IO board
+  only announces what its sensor slots measure every five seconds, so slots
+  heard before that arrive as bare counts, which for those boards are
+  hundredths of a degree. A row declaring bar is never offered as a wall.
+- **The colour ramp** runs blue through a neutral middle to red, and defaults
+  to −20 °C (a chilled fill, about 19 bar) to +40 °C, which puts N₂O's
+  36.4 °C critical point just inside the hot end and marked on the colour bar.
+  So "red" means "approaching the critical point" rather than merely "warm",
+  and 20 °C ambient sits two thirds of the way up -- which is the honest
+  picture, because ambient N₂O is not a relaxed state. Both ends are
+  adjustable; `N₂O` puts them back.
+- **Blocks** drops the interpolation and draws each sensor's region as one flat
+  rectangle of exactly what that sensor measured. The shaded picture is easier
+  to read as a fluid, but every pixel between two sensors is a guess about a
+  tank that may well be stratified in steps; this mode gives up the smoothness
+  to make each region exactly one number. The regions meet half way between
+  sensors and tile the vessel exactly.
+- **Hold** is how long one sample stands for. A sensor with nothing inside that
+  much of a moment leaves a hole rather than having its last value smeared
+  across the gap -- a dropout is drawn as one. Zoomed out, one column's width
+  wins when it is longer, since a column cannot resolve a gap narrower than
+  itself.
+
+The summary line reports the minimum, mean and maximum at the playhead, the
+top-minus-bottom stratification, and the N₂O saturation pressure at the warmest
+sensor -- the pressure the vessel is being held at, if there is still liquid in
+it -- or `SUPERCRITICAL` when there is not.
+
 ## CAN decoding
 
 A `.tlog` carries forwarded bus traffic as `CAN_FRAME` messages: an
@@ -345,3 +405,7 @@ from a real log.
   denser one's timestamps, and drops samples outside the other series' own
   time range rather than holding its first or last value. It covers nitrous
   oxide only; the curve is a property of the fluid, not a setting.
+- The tank pane assumes the sensors are evenly spaced up the wall and that the
+  number in the series name is the height. A row wired in some other order has
+  to be pointed at each height by hand. It draws ten heights and no more; a
+  longer row is cut off at the tenth.
