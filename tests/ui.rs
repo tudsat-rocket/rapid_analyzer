@@ -14,6 +14,7 @@ use egui_tiles::{Behavior as _, TileId};
 
 use rapid_analyzer::can::{CanFrame, CanFrames, FieldKind, SignalSpec};
 use rapid_analyzer::can_builder::CanBuilder;
+use rapid_analyzer::export::dialog::{DialogContext, ExportDialog};
 use rapid_analyzer::model::{LogFormat, LogSource, Project, Source, SourceKind};
 use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior};
 use rapid_analyzer::series::TimeSeries;
@@ -526,5 +527,76 @@ fn two_tank_panes_do_not_collide() {
             };
             let _ = behavior.pane_ui(ui, TileId::from_u64(1), &mut pane.clone());
         }
+    });
+}
+
+/// The export window, drawn with a couple of graphs open. It renders its own
+/// preview as it draws -- the same code path the file goes through -- so this
+/// covers the figure renderer as well as the layout of the dialog.
+#[test]
+fn the_export_window_draws_and_previews_the_figure() {
+    let mut project = project_with_two_scales();
+    let source = project.sources[0].id;
+    let mut plots = Plots::default();
+    let a = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
+    plots.add(a, source, "THRUST.force".to_string(), PlotAxis::Right);
+    let b = plots.create(source, "THRUST.force".to_string());
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 12.0;
+
+    let mut dialog = ExportDialog::default();
+    dialog.open(&[a, b]);
+    assert!(dialog.is_open());
+
+    let ctx = egui::Context::default();
+    // Twice on the same context: the second pass takes the cached preview.
+    for _ in 0..2 {
+        draw_on(&ctx, |ui| {
+            let cx = DialogContext {
+                project: &project,
+                plots: &plots,
+                timeline: &timeline,
+                visible: vec![a, b],
+            };
+            dialog.show(ui.ctx(), &cx);
+        });
+    }
+
+    // ... and with the graphs closed under it, which leaves it with nothing
+    // to export rather than with a stale selection.
+    project.sources.clear();
+    draw_on(&ctx, |ui| {
+        let cx = DialogContext {
+            project: &project,
+            plots: &plots,
+            timeline: &timeline,
+            visible: Vec::new(),
+        };
+        dialog.show(ui.ctx(), &cx);
+    });
+}
+
+/// A window past the end of the data, and a playhead outside it: both are an
+/// empty range something in the figure divides by.
+#[test]
+fn the_export_window_survives_a_range_with_no_data_in_it() {
+    let project = project_with_two_scales();
+    let source = project.sources[0].id;
+    let mut plots = Plots::default();
+    let id = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
+    let mut timeline = Timeline::new((0.0, 50.0));
+    timeline.set_view(1e6, 1e6 + 10.0);
+
+    let mut dialog = ExportDialog::default();
+    dialog.open(&[id]);
+    let ctx = egui::Context::default();
+    draw_on(&ctx, |ui| {
+        let cx = DialogContext {
+            project: &project,
+            plots: &plots,
+            timeline: &timeline,
+            visible: vec![id],
+        };
+        dialog.show(ui.ctx(), &cx);
     });
 }

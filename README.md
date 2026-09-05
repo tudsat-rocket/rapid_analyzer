@@ -46,6 +46,13 @@ zoomed together.
   height up the screen, temperature as colour, time across -- so
   stratification is a picture rather than ten graphs to compare by eye. See
   "Tank level" below.
+- **Export a figure**: "💾 Export graph…" (or `Ctrl+E`) opens a window that
+  writes the graphs you have open as an **SVG or PNG** for a report -- pick
+  which of them to include, the time window, the size on the page, the
+  resolution, the padding and the rest, with a live preview of the file you
+  are about to get. See "Exporting a figure" below.
+- **Light or dark**: the ☀ / 🌙 / 💻 buttons next to the title switch between
+  light mode, dark mode and whatever the desktop is set to.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
   any graph, adjustable playback speed, and keyboard shortcuts for all of it
   (see below).
@@ -173,9 +180,43 @@ Use "+ Import file..." in the sidebar to add more sources afterward.
 | `+` `-` | zoom the time axis in / out around the playhead |
 | `B` | box zoom: drag a rectangle in a graph to zoom into it |
 | `R` | zoom back out to everything loaded |
+| `Ctrl+E` | export the open graphs as a figure |
 
 Shortcuts are ignored while a text field (the series filter, a graph title)
 has focus.
+
+## Exporting a figure
+
+"💾 Export graph…" in the sidebar (or `Ctrl+E`) opens a window that turns the
+graphs you have open into a picture for a written report. It is not a
+screenshot: the series are laid out again at the size and resolution you ask
+for, on a white page by default, without the sidebar and the tab bar.
+
+- **Which graphs.** Every graph with a pane open is offered; ticking several
+  stacks them in one figure on a shared time axis, which is what makes them
+  readable against each other. "One file per graph" writes them separately
+  instead (`run.svg` becomes `run-1.svg`, `run-2.svg`, ...).
+- **Time range.** The current view, everything loaded, or a window typed in by
+  hand as seconds from the start of the data.
+- **Format.** **SVG** is the one to prefer: it is vector, so it prints at the
+  printer's resolution and stays sharp at any zoom, and it is what LaTeX,
+  Word, LibreOffice and Inkscape all take. **PNG** is there for tools that
+  will not take an SVG; it is written at the resolution you choose, with that
+  resolution recorded in the file, so a word processor places it at the size
+  it was asked for rather than at its own guess.
+- **Size.** Width and height per graph in millimetres -- the figure's size on
+  the page, so 160 mm is the width of a text column on A4 with 25 mm margins
+  -- plus a resolution in dpi and the padding around the whole thing.
+- **Style.** Light or dark colours (or no background at all), text size in
+  points, line width, grid lines, graph titles, where the legend goes, and
+  whether to mark the playhead.
+- **Value axes.** By default the figure keeps the value range the graph on
+  screen is showing, including one pinned by a box zoom, so the exported
+  figure is the graph you were looking at. "Fit the value axes to this window"
+  refits them to whatever the exported time range holds instead.
+
+The preview on the right is the figure, rendered by the same code as the file
+at screen resolution -- what you see there is what lands in the report.
 
 ## Custom MAVLink dialect
 
@@ -405,6 +446,19 @@ from a real log.
   denser one's timestamps, and drops samples outside the other series' own
   time range rather than holding its first or last value. It covers nitrous
   oxide only; the curve is a property of the fluid, not a setting.
+- The export covers graph panes. The video, N₂O phase and tank panes are not
+  offered: the first is a frame you already have a file of, and the other two
+  are pictures of a moment rather than of a window.
+- An exported SVG does not embed a font -- it names a sans-serif stack and
+  lets the viewer draw the text, which keeps the file small and the labels
+  selectable. Every label is anchored and given a few percent of slack, so a
+  viewer whose font is a little wider moves the text within the room reserved
+  for it; it will not match the preview glyph for glyph.
+- A PNG is composited in memory before it is written, so the exporter refuses
+  a figure over about 30 megapixels (a 200 × 150 mm figure at 600 dpi) rather
+  than trying. An SVG has no such limit.
+- The theme (and the export settings) last for the session; nothing in the app
+  is saved between runs.
 - The tank pane assumes the sensors are evenly spaced up the wall and that the
   number in the series name is the height. A row wired in some other order has
   to be pointed at each height by hand. It draws ten heights and no more; a

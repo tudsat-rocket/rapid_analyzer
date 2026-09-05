@@ -289,13 +289,13 @@ struct PreparedSeries {
 /// moves both sets of curves together instead of re-fitting one of them under
 /// the user's gesture.
 #[derive(Clone, Copy)]
-struct AxisMap {
-    from: (f64, f64),
-    to: (f64, f64),
+pub(crate) struct AxisMap {
+    pub from: (f64, f64),
+    pub to: (f64, f64),
 }
 
 impl AxisMap {
-    fn plot_y(&self, value: f64) -> f64 {
+    pub(crate) fn plot_y(&self, value: f64) -> f64 {
         let span = self.from.1 - self.from.0;
         if span.abs() < f64::EPSILON {
             return (self.to.0 + self.to.1) * 0.5;
@@ -303,7 +303,7 @@ impl AxisMap {
         self.to.0 + (value - self.from.0) / span * (self.to.1 - self.to.0)
     }
 
-    fn axis_value(&self, y: f64) -> f64 {
+    pub(crate) fn axis_value(&self, y: f64) -> f64 {
         let span = self.to.1 - self.to.0;
         if span.abs() < f64::EPSILON {
             return self.from.0;
@@ -325,7 +325,7 @@ impl AxisMap {
 
 /// Value range for an axis: the union of what its series cover in the visible
 /// window, with a little headroom, or a usable default when it has no data.
-fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
+pub(crate) fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
     let bounds = series.fold(None, |acc, (lo, hi)| {
         Some(match acc {
             Some((a, b)) => (f64::min(a, lo), f64::max(b, hi)),
@@ -342,6 +342,37 @@ fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
     })
 }
 
+/// A value axis' range, or `None` when nothing is drawn against it.
+pub(crate) type ValueRange = Option<(f64, f64)>;
+
+/// Both value axes' ranges for a graph, from what each of its series covers
+/// over the window being drawn.
+///
+/// Shared with the figure exporter (`crate::export`) so an exported graph gets
+/// the axes the pane on screen has, rather than a second opinion about them.
+pub(crate) fn value_ranges(
+    series: impl Iterator<Item = (PlotAxis, Option<(f64, f64)>)>,
+    zero_aligned: bool,
+) -> (ValueRange, ValueRange) {
+    let all: Vec<(PlotAxis, ValueRange)> = series.collect();
+    let range_of = |axis: PlotAxis| {
+        axis_range(
+            all.iter()
+                .filter(|(a, _)| *a == axis)
+                .filter_map(|(_, bounds)| *bounds),
+        )
+    };
+    let (mut left, mut right) = (range_of(PlotAxis::Left), range_of(PlotAxis::Right));
+    if zero_aligned
+        && let (Some(l), Some(r)) = (left, right)
+    {
+        let (l, r) = align_zero(l, r);
+        left = Some(l);
+        right = Some(r);
+    }
+    (left, right)
+}
+
 /// Expands both axes' ranges until zero sits at the same height on each.
 ///
 /// Only ever expands: a range that got smaller would clip the very data the
@@ -349,7 +380,7 @@ fn axis_range(series: impl Iterator<Item = (f64, f64)>) -> Option<(f64, f64)> {
 /// would naturally have put it, which splits the unavoidable empty space
 /// between the two rather than dumping it all on one. Both series entirely
 /// above zero therefore push it to the bottom of the graph, not the middle.
-fn align_zero(left: (f64, f64), right: (f64, f64)) -> ((f64, f64), (f64, f64)) {
+pub(crate) fn align_zero(left: (f64, f64), right: (f64, f64)) -> ((f64, f64), (f64, f64)) {
     let fraction = |(lo, hi): (f64, f64)| -lo / (hi - lo);
     // Away from the very edge: zero exactly on the frame is a zero the reader
     // cannot see, and the expansion needed to reach it grows without bound.
@@ -365,7 +396,7 @@ fn place_zero((lo, hi): (f64, f64), f: f64) -> (f64, f64) {
 
 /// Tick label for a value axis whose numbers we relabel ourselves, matching
 /// the precision to the spacing between ticks.
-fn format_axis_value(value: f64, step: f64) -> String {
+pub(crate) fn format_axis_value(value: f64, step: f64) -> String {
     let decimals = if step > 0.0 {
         (-step.log10().floor()).clamp(0.0, 6.0) as usize
     } else {
@@ -395,7 +426,7 @@ impl<'a> TreeBehavior<'a> {
         let cursor = self.timeline.cursor;
 
         let Some(plot) = self.plots.list.iter_mut().find(|p| p.id == plot_id) else {
-            ui.colored_label(Color32::RED, "plot no longer exists");
+            error_label(ui, "plot no longer exists");
             return;
         };
 
@@ -516,23 +547,10 @@ impl<'a> TreeBehavior<'a> {
         // drawing, so a thrust curve in kN and a pressure in bar can share a
         // graph without either being flattened into a straight line.
         let has_right = prepared.iter().any(|s| s.axis == PlotAxis::Right) && !normalize;
-        let range_of = |axis: PlotAxis| {
-            axis_range(
-                prepared
-                    .iter()
-                    .filter(|s| s.axis == axis)
-                    .filter_map(|s| s.bounds),
-            )
-        };
-        let mut left_range = range_of(PlotAxis::Left);
-        let mut right_range = range_of(PlotAxis::Right);
-        if plot.zero_aligned
-            && let (Some(left), Some(right)) = (left_range, right_range)
-        {
-            let (left, right) = align_zero(left, right);
-            left_range = Some(left);
-            right_range = Some(right);
-        }
+        let (left_range, right_range) = value_ranges(
+            prepared.iter().map(|s| (s.axis, s.bounds)),
+            plot.zero_aligned,
+        );
 
         // With nothing on the left, right-axis series keep their own numbers
         // rather than being mapped into a range that isn't there.
@@ -650,7 +668,7 @@ impl<'a> TreeBehavior<'a> {
 
     fn vapor_pane(&mut self, ui: &mut egui::Ui, id: VaporId) {
         let Some(vapor) = self.vapors.get_mut(id) else {
-            ui.colored_label(Color32::RED, "this phase pane no longer exists");
+            error_label(ui, "this phase pane no longer exists");
             return;
         };
         if vapor.ui(ui, self.project, self.timeline) {
@@ -660,7 +678,7 @@ impl<'a> TreeBehavior<'a> {
 
     fn tank_pane(&mut self, ui: &mut egui::Ui, id: TankId) {
         let Some(tank) = self.tanks.get_mut(id) else {
-            ui.colored_label(Color32::RED, "this tank pane no longer exists");
+            error_label(ui, "this tank pane no longer exists");
             return;
         };
         if tank.ui(ui, self.project, self.timeline) {
@@ -670,11 +688,11 @@ impl<'a> TreeBehavior<'a> {
 
     fn video_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
         let Some(source) = self.project.source(source_id) else {
-            ui.colored_label(Color32::RED, "source no longer loaded");
+            error_label(ui, "source no longer loaded");
             return;
         };
         let SourceKind::Video(video) = &source.kind else {
-            ui.colored_label(Color32::RED, "not a video source");
+            error_label(ui, "not a video source");
             return;
         };
         let local_t = source.to_local_time(self.timeline.cursor);
@@ -716,19 +734,22 @@ impl<'a> TreeBehavior<'a> {
 
         if !in_range {
             let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-            ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+            // The darkest/lightest surface the theme has, so the placeholder
+            // reads as an empty frame in light mode too rather than a hole.
+            let (fill, text) = (ui.visuals().extreme_bg_color, ui.visuals().weak_text_color());
+            ui.painter().rect_filled(rect, 0.0, fill);
             let label = if local_t < 0.0 { "before this recording" } else { "after this recording" };
             ui.painter().text(
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 label,
                 egui::FontId::proportional(13.0),
-                Color32::from_gray(90),
+                text,
             );
         } else if let Some(texture) = &worker.texture {
             egui::Image::new(texture).fit_to_exact_size(size).ui(ui);
         } else if let Some(err) = &worker.error {
-            ui.colored_label(Color32::RED, err);
+            error_label(ui, err);
             // The overwhelmingly common one, and not obvious from ffmpeg's
             // wording: distributions ship builds with whole codecs removed.
             if err.contains("no decoder found") {
@@ -741,11 +762,11 @@ impl<'a> TreeBehavior<'a> {
 
     fn audio_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
         let Some(source) = self.project.source(source_id) else {
-            ui.colored_label(Color32::RED, "source no longer loaded");
+            error_label(ui, "source no longer loaded");
             return;
         };
         let SourceKind::Audio(audio) = &source.kind else {
-            ui.colored_label(Color32::RED, "not an audio source");
+            error_label(ui, "not an audio source");
             return;
         };
         let color = source.color;
@@ -817,7 +838,8 @@ impl<'a> TreeBehavior<'a> {
         self.apply_view_change(&response.transform, (y_lo, y_hi), clicked_time);
 
         if matches!(self.audio_players.get(&source_id), Some(None)) {
-            ui.colored_label(Color32::YELLOW, "audio playback unavailable (no output device) -- waveform still shown");
+            let warn = ui.visuals().warn_fg_color;
+            ui.colored_label(warn, "audio playback unavailable (no output device) -- waveform still shown");
         }
     }
 
@@ -869,6 +891,13 @@ fn short_title(name: &str) -> String {
         return name.to_string();
     }
     format!("{}…", name.chars().take(MAX - 1).collect::<String>())
+}
+
+/// A pane that cannot draw what it was asked to, in the theme's error colour
+/// -- a fixed red is illegible on a light background.
+fn error_label(ui: &mut egui::Ui, text: &str) {
+    let color = ui.visuals().error_fg_color;
+    ui.colored_label(color, text);
 }
 
 /// Legend labels repeat the message prefix on every line; the playhead

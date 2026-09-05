@@ -208,8 +208,9 @@ impl CanBuilder {
                 ));
             }
             None => {
+                let warn = ui.visuals().warn_fg_color;
                 ui.colored_label(
-                    egui::Color32::YELLOW,
+                    warn,
                     "No samples: no frame with this identifier is long enough to hold that field.",
                 );
             }

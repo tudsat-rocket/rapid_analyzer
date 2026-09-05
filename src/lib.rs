@@ -4,6 +4,7 @@ pub mod can;
 pub mod can_builder;
 pub mod colors;
 pub mod dialect;
+pub mod export;
 pub mod import;
 pub mod mavlink_meta;
 pub mod model;

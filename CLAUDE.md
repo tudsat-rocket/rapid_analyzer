@@ -137,6 +137,54 @@ and are therefore pinned by tests:
 Being a painter rather than an `egui_plot`, it gets no gestures for free: `interact`
 writes pan/zoom/seek back into `Timeline` itself.
 
+### Exporting a figure
+
+`src/export/` writes the open graphs as an SVG or a PNG for a report. It is
+deliberately not a screenshot -- wrong resolution, wrong colours for paper, and
+the sidebar comes with it -- so the series are laid out a second time:
+
+- `export/figure.rs` is the drawing, and knows nothing about what it draws
+  into: every mark goes through the `Canvas` trait. Coordinates are "figure
+  units", CSS pixels at 96 to the inch, which is what an SVG `viewBox` is in;
+  the raster backend scales by `dpi / 96`. One layout, one set of ticks, two
+  files that agree.
+- `export/svg.rs` writes vector text. It cannot embed a font, so it names a
+  font stack and *anchors* every string; `figure::TEXT_SLACK` is the few
+  percent of extra room every measured label gets. That slack is applied in
+  the layout, not in the backend, or the two backends would choose different
+  tick spacings for the same settings and the preview would not be of the file.
+- `export/raster.rs` is a small software rasterizer: analytic coverage for
+  polylines and rects, and text *blitted* out of egui's own font atlas, laid
+  out at the export's resolution so a glyph's atlas entry and its destination
+  are the same size. Compositing is premultiplied alpha in gamma space, which
+  is both what egui's shader does and what an SVG renderer does by default.
+  It also writes the PNG's `pHYs` chunk, without which "300 dpi" means nothing
+  to a word processor.
+- `export/text.rs` owns the one `epaint::Fonts` both backends measure with.
+  The atlas can only be read *after* everything has been laid out, which is
+  why the raster backend queues text and blits it at the end.
+- `export/mod.rs` turns `Plots` into a `Figure`, and `export/dialog.rs` is the
+  window. Both axes' ranges come from `panes::value_ranges` -- the same
+  function the pane on screen uses -- so an exported graph is the graph the
+  user was looking at, including a range pinned by a box zoom (which the right
+  axis follows through `panes::AxisMap`, exactly as it does on screen).
+
+The dialog's preview is the figure rendered by the raster backend at screen
+resolution, recomputed only when its `preview_key` changes -- settings, the
+selection, the window, or the data behind it.
+
+### Theme
+
+`App::theme` is an `egui::ThemePreference` applied to the context every frame
+(egui owns the preference, not us) and the root `Ui`'s style is overwritten
+with it, or a switch would leave the panels a frame behind. Anything drawn by
+hand therefore has to come from `ui.visuals()`; a hardcoded `Color32::RED`
+warning is illegible on a light background. The two exceptions are the
+playhead colour and `colors.rs`' series palette, which are deliberately fixed:
+a source's colour is picked once at import and an exported figure is usually
+the opposite theme of the app, so every palette entry clears 3:1 contrast
+against both a white page and the dark theme's near-black background.
+
 ### CAN
 
 `src/can/` exists because a CAN frame is a container, not a measurement: the generic tlog path
@@ -176,6 +224,10 @@ drifts >0.3 s from the timeline cursor; a missing output device is cached as `No
 `audio_players` so it isn't retried every frame.
 
 ### UI panes
+
+The export window (`export::dialog`) and the CAN picker are `egui::Window`s
+rather than panes: both are a detour from reviewing a run, and the graphs
+behind them stay usable.
 
 `egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot(PlotId)`,
 `Video`, `Audio`, `Vapor(VaporId)`, `Tank(TankId)`). `App` keeps a `pane_tiles: HashMap<Pane, TileId>` alongside the tree — sidebar

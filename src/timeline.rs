@@ -141,7 +141,7 @@ pub fn format_utc(t: f64) -> String {
 /// powers of ten, which on a time axis puts lines at 100- and 1000-second
 /// intervals -- numbers nobody reads a clock in, and coarse enough that a
 /// ten-minute window ends up with a single labelled tick.
-const TIME_STEPS: &[f64] = &[
+pub(crate) const TIME_STEPS: &[f64] = &[
     0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, // sub-second
     1.0, 2.0, 5.0, 10.0, 15.0, 30.0, // seconds
     60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, // minutes

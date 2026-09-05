@@ -7,6 +7,7 @@ use egui_tiles::{Tile, TileId};
 
 use crate::can_builder::{BuilderAction, CanBuilder};
 use crate::colors::color_for_index;
+use crate::export::dialog::{DialogContext, ExportDialog};
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
 use crate::panes::{AudioPlayerSlot, Pane, PlotAxis, PlotId, Plots, TreeBehavior};
@@ -54,6 +55,12 @@ pub struct App {
     /// The CAN signal picker, while it is open. At most one at a time -- it
     /// is a modal-ish tool, not a per-source panel.
     can_builder: Option<CanBuilder>,
+    /// The figure exporter's window. It keeps its settings between openings,
+    /// so a report's second figure is one click away from its first.
+    export: ExportDialog,
+    /// Light, dark, or whatever the desktop is set to. Applied to the context
+    /// every frame, since egui holds it in its own options rather than here.
+    theme: egui::ThemePreference,
 }
 
 impl App {
@@ -77,6 +84,8 @@ impl App {
             last_update: Instant::now(),
             ffmpeg_available: import::video::ffmpeg_available(),
             can_builder: None,
+            export: ExportDialog::default(),
+            theme: egui::ThemePreference::System,
         };
         for path in initial_files {
             app.start_import(path);
@@ -218,6 +227,41 @@ impl App {
         }
     }
 
+    /// The graphs the exporter can offer: the ones with a pane open, in the
+    /// order they were created.
+    fn visible_plots(&self) -> Vec<PlotId> {
+        crate::export::visible_plots(
+            self.pane_tiles.keys().filter_map(|pane| match pane {
+                Pane::Plot(id) => Some(*id),
+                _ => None,
+            }),
+            &self.plots,
+        )
+    }
+
+    fn open_export(&mut self) {
+        let visible = self.visible_plots();
+        self.export.open(&visible);
+    }
+
+    /// The export window, and the one thing it hands back: a line saying what
+    /// it wrote.
+    fn export_window(&mut self, ctx: &egui::Context) {
+        if !self.export.is_open() {
+            return;
+        }
+        let visible = self.visible_plots();
+        let cx = DialogContext {
+            project: &self.project,
+            plots: &self.plots,
+            timeline: &self.timeline,
+            visible,
+        };
+        if let Some(status) = self.export.show(ctx, &cx) {
+            self.status = Some(status);
+        }
+    }
+
     /// The CAN signal picker, and what it hands back: a series the log didn't
     /// name itself, which joins that source's series list as if it had.
     fn can_signal_builder(&mut self, ctx: &egui::Context) {
@@ -306,7 +350,12 @@ impl App {
     }
 
     fn source_browser(&mut self, ui: &mut egui::Ui) {
-        ui.heading("rapid-analyzer");
+        ui.horizontal(|ui| {
+            ui.heading("rapid-analyzer");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                theme_switch(ui, &mut self.theme);
+            });
+        });
         ui.horizontal(|ui| {
             if ui.button("+ Import file...").clicked()
                 && let Some(path) = rfd::FileDialog::new().pick_file() {
@@ -319,6 +368,7 @@ impl App {
         // Applied after the borrow of `self.project` below is over.
         let mut new_vapor_pane = false;
         let mut new_tank_pane = false;
+        let mut open_export = false;
         // Offered even with nothing imported: the vapour pressure curve is
         // worth looking at on its own.
         if ui
@@ -339,8 +389,16 @@ impl App {
         {
             new_tank_pane = true;
         }
+        if ui
+            .button("💾 Export graph…")
+            .on_hover_text("Save the graphs you have open as an SVG or PNG, for a report  (Ctrl+E)")
+            .clicked()
+        {
+            open_export = true;
+        }
         if !self.ffmpeg_available {
-            ui.colored_label(egui::Color32::YELLOW, "⚠ ffmpeg not found -- video/audio import will fail");
+            let warn = ui.visuals().warn_fg_color;
+            ui.colored_label(warn, "⚠ ffmpeg not found -- video/audio import will fail");
         }
         if let Some(status) = self.status.clone() {
             ui.small(status);
@@ -352,6 +410,9 @@ impl App {
         }
         if new_tank_pane {
             self.apply(PendingAction::NewTankPane);
+        }
+        if open_export {
+            self.open_export();
         }
         if self.project.sources.is_empty() {
             ui.weak("No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file.");
@@ -460,6 +521,7 @@ impl App {
             return;
         }
         let bounds = self.project.time_bounds();
+        let mut open_export = false;
         ctx.input(|i| {
             // Shift for a coarse step, Alt for a fine one: the same gesture
             // at three scales rather than three keys.
@@ -510,11 +572,33 @@ impl App {
                         self.plots.clear_manual_ranges();
                     }
                     egui::Key::B if modifiers.is_none() => self.timeline.box_zoom = !self.timeline.box_zoom,
+                    egui::Key::E if modifiers.command => open_export = true,
                     _ => {}
                 }
             }
         });
+        if open_export {
+            self.open_export();
+        }
     }
+}
+
+/// Light, dark, or the desktop's own setting.
+///
+/// Icons rather than words: it lives in the sidebar's heading row, which is
+/// the one place in the panel that must not be allowed to grow.
+fn theme_switch(ui: &mut egui::Ui, theme: &mut egui::ThemePreference) {
+    use egui::ThemePreference;
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        // Laid out right to left, so these read 💻 ☀ 🌙 on screen.
+        ui.selectable_value(theme, ThemePreference::Dark, "🌙")
+            .on_hover_text("Dark mode");
+        ui.selectable_value(theme, ThemePreference::Light, "☀")
+            .on_hover_text("Light mode");
+        ui.selectable_value(theme, ThemePreference::System, "💻")
+            .on_hover_text("Follow the system theme");
+    });
 }
 
 /// The next playback speed up (`direction` 1) or down the ladder.
@@ -707,6 +791,12 @@ fn group_of(name: &str) -> Option<&str> {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // egui keeps the preference, not us, so it is set every frame. The
+        // `Ui` we were handed was built with the *previous* frame's style, so
+        // it is restyled here too -- otherwise a theme switch would leave the
+        // panels one frame behind the window.
+        ctx.set_theme(self.theme);
+        *ui.style_mut() = (*ctx.global_style()).clone();
         self.poll_imports();
         self.handle_shortcuts(&ctx);
 
@@ -727,6 +817,7 @@ impl eframe::App for App {
         });
 
         self.can_signal_builder(&ctx);
+        self.export_window(&ctx);
 
         let mut closed = Vec::new();
         egui::CentralPanel::default().show(ui, |ui| {
