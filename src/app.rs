@@ -7,6 +7,7 @@ use egui_tiles::{Tile, TileId};
 
 use crate::can_builder::{BuilderAction, CanBuilder};
 use crate::colors::color_for_index;
+use crate::export::ExportItem;
 use crate::export::dialog::{DialogContext, ExportDialog};
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
@@ -227,20 +228,26 @@ impl App {
         }
     }
 
-    /// The graphs the exporter can offer: the ones with a pane open, in the
-    /// order they were created.
-    fn visible_plots(&self) -> Vec<PlotId> {
-        crate::export::visible_plots(
-            self.pane_tiles.keys().filter_map(|pane| match pane {
-                Pane::Plot(id) => Some(*id),
-                _ => None,
-            }),
-            &self.plots,
-        )
+    /// The panes the exporter can offer: the graphs and tanks with a pane
+    /// open, in the order they were created.
+    fn visible_exports(&self) -> Vec<ExportItem> {
+        let plots = self
+            .plots
+            .iter()
+            .map(|plot| plot.id)
+            .filter(|id| self.pane_tiles.contains_key(&Pane::Plot(*id)))
+            .map(ExportItem::Plot);
+        let tanks = self
+            .tanks
+            .iter()
+            .map(|tank| tank.id)
+            .filter(|id| self.pane_tiles.contains_key(&Pane::Tank(*id)))
+            .map(ExportItem::Tank);
+        plots.chain(tanks).collect()
     }
 
     fn open_export(&mut self) {
-        let visible = self.visible_plots();
+        let visible = self.visible_exports();
         self.export.open(&visible);
     }
 
@@ -250,10 +257,11 @@ impl App {
         if !self.export.is_open() {
             return;
         }
-        let visible = self.visible_plots();
+        let visible = self.visible_exports();
         let cx = DialogContext {
             project: &self.project,
             plots: &self.plots,
+            tanks: &self.tanks,
             timeline: &self.timeline,
             visible,
         };

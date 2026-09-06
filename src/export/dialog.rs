@@ -14,11 +14,12 @@ use std::path::PathBuf;
 use egui::Vec2;
 
 use super::{
-    ExportFormat, ExportSettings, ExportTheme, FigureRequest, LegendPos, RangeMode, build_figure, export, figure,
-    raster, sanitize_file_name,
+    ExportFormat, ExportItem, ExportSettings, ExportTheme, FigureRequest, LegendPos, RangeMode, build_figure, export,
+    figure, raster, sanitize_file_name,
 };
 use crate::model::{Project, SourceKind};
-use crate::panes::{PlotId, Plots};
+use crate::panes::Plots;
+use crate::tank::Tanks;
 use crate::timeline::{Timeline, format_duration, format_utc};
 
 /// Widest the preview is rendered, in screen points. Big enough to read the
@@ -39,18 +40,26 @@ const SETTINGS_WIDTH: f32 = 400.0;
 pub struct DialogContext<'a> {
     pub project: &'a Project,
     pub plots: &'a Plots,
+    pub tanks: &'a Tanks,
     pub timeline: &'a Timeline,
-    /// The graphs with a pane open, in the order they were created.
-    pub visible: Vec<PlotId>,
+    /// The panes that can be exported and are open, in the order they were
+    /// created: the graphs, then the tanks.
+    pub visible: Vec<ExportItem>,
+}
+
+impl DialogContext<'_> {
+    fn title(&self, item: ExportItem) -> String {
+        item.title(self.plots, self.tanks)
+    }
 }
 
 #[derive(Default)]
 pub struct ExportDialog {
     open: bool,
     settings: ExportSettings,
-    /// Graphs ticked for export. Kept across openings, and filtered against
+    /// Panes ticked for export. Kept across openings, and filtered against
     /// what is actually on screen every time it is shown.
-    selected: HashSet<PlotId>,
+    selected: HashSet<ExportItem>,
     preview: Option<egui::TextureHandle>,
     /// What the preview was rendered from, so it is redrawn when -- and only
     /// when -- something it depends on changes.
@@ -67,8 +76,8 @@ impl ExportDialog {
         self.open
     }
 
-    /// Opens the window, starting from every graph currently on screen.
-    pub fn open(&mut self, visible: &[PlotId]) {
+    /// Opens the window, starting from every exportable pane on screen.
+    pub fn open(&mut self, visible: &[ExportItem]) {
         self.open = true;
         self.error = None;
         self.notice = None;
@@ -188,8 +197,8 @@ impl ExportDialog {
         }
     }
 
-    /// The graphs to export, in the order they are shown in.
-    fn ordered_selection(&self, cx: &DialogContext<'_>) -> Vec<PlotId> {
+    /// The panes to export, in the order they are shown in.
+    fn ordered_selection(&self, cx: &DialogContext<'_>) -> Vec<ExportItem> {
         cx.visible.iter().copied().filter(|id| self.selected.contains(id)).collect()
     }
 
@@ -209,7 +218,7 @@ impl ExportDialog {
         ui.scope(|ui| {
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
             for id in &cx.visible {
-                let title = cx.plots.get(*id).map_or_else(|| "plot".to_string(), |p| p.title());
+                let title = cx.title(*id);
                 let mut on = self.selected.contains(id);
                 if ui.checkbox(&mut on, &title).on_hover_text(title.clone()).changed() {
                     if on {
@@ -450,6 +459,7 @@ impl ExportDialog {
         let request = FigureRequest {
             project: cx.project,
             plots: cx.plots,
+            tanks: cx.tanks,
             ids,
             range,
             cursor: Some(cx.timeline.cursor),
@@ -477,10 +487,21 @@ impl ExportDialog {
         range.0.to_bits().hash(&mut hasher);
         range.1.to_bits().hash(&mut hasher);
         cx.timeline.cursor.to_bits().hash(&mut hasher);
-        for id in self.ordered_selection(cx) {
-            id.hash(&mut hasher);
+        for item in self.ordered_selection(cx) {
+            item.hash(&mut hasher);
+            cx.title(item).hash(&mut hasher);
+            let ExportItem::Plot(id) = item else {
+                // A tank pane's own settings -- the ramp, the modes, which
+                // series each height reads -- are not on `ExportSettings`, so
+                // they are hashed here.
+                if let ExportItem::Tank(id) = item
+                    && let Some(tank) = cx.tanks.get(id)
+                {
+                    hash_tank(tank, cx, &mut hasher);
+                }
+                continue;
+            };
             let Some(plot) = cx.plots.get(id) else { continue };
-            plot.title().hash(&mut hasher);
             for entry in &plot.entries {
                 entry.source.hash(&mut hasher);
                 entry.series.hash(&mut hasher);
@@ -503,11 +524,7 @@ impl ExportDialog {
     /// Asks for a file and writes it.
     fn save(&mut self, cx: &DialogContext<'_>, range: (f64, f64)) -> Option<String> {
         let ids = self.ordered_selection(cx);
-        let title = ids
-            .first()
-            .and_then(|id| cx.plots.get(*id))
-            .map(|p| p.title())
-            .unwrap_or_else(|| "figure".to_string());
+        let title = ids.first().map_or_else(|| "figure".to_string(), |item| cx.title(*item));
         let extension = self.settings.format.extension();
         let mut dialog = rfd::FileDialog::new()
             .set_file_name(format!("{}.{extension}", sanitize_file_name(&title)))
@@ -527,6 +544,7 @@ impl ExportDialog {
         let request = FigureRequest {
             project: cx.project,
             plots: cx.plots,
+            tanks: cx.tanks,
             ids: &ids,
             range,
             cursor: Some(cx.timeline.cursor),
@@ -556,6 +574,7 @@ impl ExportDialog {
         let request = FigureRequest {
             project: cx.project,
             plots: cx.plots,
+            tanks: cx.tanks,
             ids: &ids,
             range,
             cursor: None,
@@ -568,6 +587,37 @@ impl ExportDialog {
 /// is the same arithmetic the file uses.
 pub fn preview_scale(size: Vec2) -> f32 {
     (PREVIEW_WIDTH / size.x.max(1.0)).min(PREVIEW_MAX_HEIGHT / size.y.max(1.0))
+}
+
+/// Everything about a tank pane the picture depends on: its scale, its modes,
+/// which series each height reads, and how much of them there is.
+///
+/// None of it lives on [`ExportSettings`], so the preview would otherwise not
+/// notice a ramp being dragged in the pane behind the window.
+fn hash_tank(tank: &crate::tank::TankSpec, cx: &DialogContext<'_>, hasher: &mut impl std::hash::Hasher) {
+    tank.lo_c.to_bits().hash(hasher);
+    tank.hi_c.to_bits().hash(hasher);
+    tank.hold_s.to_bits().hash(hasher);
+    tank.blocks.hash(hasher);
+    tank.grid.hash(hasher);
+    format!("{:?}", tank.unit).hash(hasher);
+    for slot in &tank.sensors {
+        match slot {
+            None => 0u8.hash(hasher),
+            Some(r) => {
+                r.source.hash(hasher);
+                r.series.hash(hasher);
+                if let Some(source) = cx.project.source(r.source) {
+                    source.offset_seconds.to_bits().hash(hasher);
+                    if let SourceKind::Log(log) = &source.kind
+                        && let Some(series) = log.series.iter().find(|s| s.name == r.series)
+                    {
+                        series.len().hash(hasher);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -600,8 +650,8 @@ mod tests {
     #[test]
     fn opening_the_dialog_starts_from_what_is_on_screen() {
         let mut plots = Plots::default();
-        let a = plots.create(0, "PV[1].pressure".to_string());
-        let b = plots.create(0, "PV[1].pressure".to_string());
+        let a = ExportItem::Plot(plots.create(0, "PV[1].pressure".to_string()));
+        let b = ExportItem::Plot(plots.create(0, "PV[1].pressure".to_string()));
         let mut dialog = ExportDialog::default();
         dialog.open(&[a, b]);
         assert!(dialog.is_open());
@@ -610,10 +660,12 @@ mod tests {
         // A graph whose pane is closed drops out of the selection rather than
         // being exported from memory.
         let project = project();
+        let tanks = Tanks::default();
         let timeline = Timeline::new((0.0, 20.0));
         let cx = DialogContext {
             project: &project,
             plots: &plots,
+            tanks: &tanks,
             timeline: &timeline,
             visible: vec![a],
         };
@@ -625,11 +677,13 @@ mod tests {
     fn the_preview_is_only_redrawn_when_something_changed() {
         let project = project();
         let mut plots = Plots::default();
-        let id = plots.create(project.sources[0].id, "PV[1].pressure".to_string());
+        let tanks = Tanks::default();
+        let id = ExportItem::Plot(plots.create(project.sources[0].id, "PV[1].pressure".to_string()));
         let timeline = Timeline::new((0.0, 20.0));
         let cx = DialogContext {
             project: &project,
             plots: &plots,
+            tanks: &tanks,
             timeline: &timeline,
             visible: vec![id],
         };
@@ -647,13 +701,16 @@ mod tests {
     fn the_figure_carries_the_series_and_its_unit() {
         let project = project();
         let mut plots = Plots::default();
+        let tanks = Tanks::default();
         let source = project.sources[0].id;
-        let id = plots.create(source, "PV[1].pressure".to_string());
-        plots.add(id, source, "PV[1].pressure".to_string(), PlotAxis::Left);
+        let plot = plots.create(source, "PV[1].pressure".to_string());
+        plots.add(plot, source, "PV[1].pressure".to_string(), PlotAxis::Left);
+        let id = ExportItem::Plot(plot);
         let timeline = Timeline::new((0.0, 20.0));
         let cx = DialogContext {
             project: &project,
             plots: &plots,
+            tanks: &tanks,
             timeline: &timeline,
             visible: vec![id],
         };
@@ -662,12 +719,58 @@ mod tests {
 
         let figure = dialog.figure_for(&cx, (0.0, 20.0));
         assert_eq!(figure.panels.len(), 1);
-        let panel = &figure.panels[0];
-        assert_eq!(panel.series.len(), 1);
-        assert_eq!(panel.left_label, "bar");
-        assert!(panel.right.is_none());
-        assert!(!panel.series[0].points.is_empty());
+        let figure::Content::Graph(graph) = &figure.panels[0].content else {
+            panic!("a graph pane exports a graph");
+        };
+        assert_eq!(graph.series.len(), 1);
+        assert_eq!(graph.left_label, "bar");
+        assert!(graph.right.is_none());
+        assert!(!graph.series[0].points.is_empty());
         // The axis covers the data, with the headroom the pane gives it.
-        assert!(panel.left.0 < 30.0 && panel.left.1 > 50.0, "{:?}", panel.left);
+        assert!(graph.left.0 < 30.0 && graph.left.1 > 50.0, "{:?}", graph.left);
+    }
+
+    /// The tank pane is exportable too, and its own settings -- which are not
+    /// part of `ExportSettings` -- have to reach the preview.
+    #[test]
+    fn a_tank_pane_is_offered_and_redrawn_when_its_own_settings_change() {
+        let project = project();
+        let plots = Plots::default();
+        let mut tanks = Tanks::default();
+        let tank = tanks.create(&project);
+        let id = ExportItem::Tank(tank);
+        let timeline = Timeline::new((0.0, 20.0));
+        let mut dialog = ExportDialog::default();
+        dialog.open(&[id]);
+        assert_eq!(dialog.selected.len(), 1);
+
+        let key = {
+            let cx = DialogContext {
+                project: &project,
+                plots: &plots,
+                tanks: &tanks,
+                timeline: &timeline,
+                visible: vec![id],
+            };
+            assert!(cx.title(id).starts_with("Tank"), "{}", cx.title(id));
+            dialog.preview_key(&cx, (0.0, 20.0))
+        };
+
+        tanks.get_mut(tank).unwrap().hi_c += 5.0;
+        let cx = DialogContext {
+            project: &project,
+            plots: &plots,
+            tanks: &tanks,
+            timeline: &timeline,
+            visible: vec![id],
+        };
+        assert_ne!(key, dialog.preview_key(&cx, (0.0, 20.0)), "the ramp moved");
+
+        let figure = dialog.figure_for(&cx, (0.0, 20.0));
+        let figure::Content::Tank(exported) = &figure.panels[0].content else {
+            panic!("a tank pane exports a tank");
+        };
+        assert!(exported.field.cols > 2);
+        assert_eq!(exported.hi_c, tanks.get(tank).unwrap().hi_c);
     }
 }

@@ -47,10 +47,10 @@ zoomed together.
   stratification is a picture rather than ten graphs to compare by eye. See
   "Tank level" below.
 - **Export a figure**: "💾 Export graph…" (or `Ctrl+E`) opens a window that
-  writes the graphs you have open as an **SVG or PNG** for a report -- pick
-  which of them to include, the time window, the size on the page, the
-  resolution, the padding and the rest, with a live preview of the file you
-  are about to get. See "Exporting a figure" below.
+  writes the graphs and tank panes you have open as an **SVG or PNG** for a
+  report -- pick which of them to include, the time window, the size on the
+  page, the resolution, the padding and the rest, with a live preview of the
+  file you are about to get. See "Exporting a figure" below.
 - **Light or dark**: the ☀ / 🌙 / 💻 buttons next to the title switch between
   light mode, dark mode and whatever the desktop is set to.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
@@ -192,10 +192,11 @@ graphs you have open into a picture for a written report. It is not a
 screenshot: the series are laid out again at the size and resolution you ask
 for, on a white page by default, without the sidebar and the tab bar.
 
-- **Which graphs.** Every graph with a pane open is offered; ticking several
-  stacks them in one figure on a shared time axis, which is what makes them
-  readable against each other. "One file per graph" writes them separately
-  instead (`run.svg` becomes `run-1.svg`, `run-2.svg`, ...).
+- **Which panes.** Every graph and every tank pane that is open is offered;
+  ticking several stacks them in one figure on a shared time axis, which is
+  what makes them readable against each other -- a tank's stratification under
+  the chamber pressure that caused it. "One file per graph" writes them
+  separately instead (`run.svg` becomes `run-1.svg`, `run-2.svg`, ...).
 - **Time range.** The current view, everything loaded, or a window typed in by
   hand as seconds from the start of the data.
 - **Format.** **SVG** is the one to prefer: it is vector, so it prints at the
@@ -210,6 +211,12 @@ for, on a white page by default, without the sidebar and the tab bar.
 - **Style.** Light or dark colours (or no background at all), text size in
   points, line width, grid lines, graph titles, where the legend goes, and
   whether to mark the playhead.
+- **Tank panes.** A tank is exported as the pane draws it: the same colour
+  ramp, the same shaded or blocks mode, the same heights, with the colour bar
+  (and the critical point marked on it) beside it. The shading is a real
+  gradient in the SVG, so it stays an interpolation at any print resolution.
+  The ten readouts beside the pane are not included -- they are a reading at
+  the playhead, and a figure covers a window.
 - **Value axes.** By default the figure keeps the value range the graph on
   screen is showing, including one pinned by a box zoom, so the exported
   figure is the graph you were looking at. "Fit the value axes to this window"
@@ -446,9 +453,10 @@ from a real log.
   denser one's timestamps, and drops samples outside the other series' own
   time range rather than holding its first or last value. It covers nitrous
   oxide only; the curve is a property of the fluid, not a setting.
-- The export covers graph panes. The video, N₂O phase and tank panes are not
-  offered: the first is a frame you already have a file of, and the other two
-  are pictures of a moment rather than of a window.
+- The export covers graph and tank panes -- the two that are drawn against the
+  master timeline. The video pane is not offered (it is a frame you already
+  have a file of), nor is the N₂O phase pane, whose axes are a temperature and
+  a pressure rather than time, so it cannot share a figure's time axis.
 - An exported SVG does not embed a font -- it names a sans-serif stack and
   lets the viewer draw the text, which keeps the file small and the labels
   selectable. Every label is anchored and given a few percent of slack, so a

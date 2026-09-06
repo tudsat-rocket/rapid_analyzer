@@ -29,6 +29,7 @@ pub struct SvgCanvas {
     body: String,
     clips: usize,
     clipped: bool,
+    gradients: usize,
 }
 
 impl SvgCanvas {
@@ -42,6 +43,7 @@ impl SvgCanvas {
             body: String::new(),
             clips: 0,
             clipped: false,
+            gradients: 0,
         }
     }
 
@@ -125,6 +127,55 @@ impl Canvas for SvgCanvas {
             "<polyline fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{}\" stroke-linecap=\"round\" \
              stroke-linejoin=\"round\"{opacity} points=\"{d}\"/>\n",
             num(width)
+        ));
+    }
+
+    fn fill_cell(&mut self, rect: Rect, color: Color32) {
+        if color.a() == 0 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+            return;
+        }
+        let (fill, opacity) = paint(color);
+        let cell = cell_geometry(rect);
+        self.body.push_str(&format!(
+            "<rect {cell} fill=\"{fill}\"{opacity} shape-rendering=\"crispEdges\"/>\n"
+        ));
+    }
+
+    fn vertical_gradient(&mut self, rect: Rect, stops: &[(f32, Color32)]) {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 || stops.is_empty() {
+            return;
+        }
+        // One stop is a flat fill; a gradient with a single stop is not
+        // defined the same way by every renderer.
+        if stops.len() == 1 {
+            self.fill_cell(rect, stops[0].1);
+            return;
+        }
+        let id = format!("grad{}", self.gradients);
+        self.gradients += 1;
+        // Object bounding box units, so the same gradient definition works
+        // whatever size the rect is.
+        self.defs.push_str(&format!(
+            "<linearGradient id=\"{id}\" x1=\"0\" y1=\"0\" x2=\"0\" y2=\"1\">"
+        ));
+        for (at, color) in stops {
+            let [r, g, b, a] = color.to_srgba_unmultiplied();
+            let opacity = if a == 255 {
+                String::new()
+            } else {
+                format!(" stop-opacity=\"{}\"", num(a as f32 / 255.0))
+            };
+            self.defs.push_str(&format!(
+                "<stop offset=\"{}\" stop-color=\"#{r:02x}{g:02x}{b:02x}\"{opacity}/>",
+                num(at.clamp(0.0, 1.0))
+            ));
+        }
+        self.defs.push_str("</linearGradient>\n");
+        // Crisp edges: two of these side by side must not leave a hairline of
+        // background between them -- see `Canvas::fill_cell`.
+        let cell = cell_geometry(rect);
+        self.body.push_str(&format!(
+            "<rect {cell} fill=\"url(#{id})\" shape-rendering=\"crispEdges\"/>\n"
         ));
     }
 
@@ -223,6 +274,31 @@ fn anchor_for(align: Align) -> &'static str {
     }
 }
 
+/// A cell's `x`/`y`/`width`/`height`, arrived at from its *edges*.
+///
+/// Both edges are rounded to the grid the numbers are printed on, and the size
+/// is their difference -- so the right edge of one cell is written as exactly
+/// the same number as the left edge of the next. Taking the width from the
+/// rect instead lets the two disagree in the last decimal, and a renderer
+/// snapping each cell to the pixel grid separately then leaves a one-pixel
+/// hairline of background between them.
+fn cell_geometry(rect: Rect) -> String {
+    let (left, top) = (quantize(rect.left()), quantize(rect.top()));
+    let (right, bottom) = (quantize(rect.right()), quantize(rect.bottom()));
+    format!(
+        "x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"",
+        num(left),
+        num(top),
+        num((right - left).max(0.0)),
+        num((bottom - top).max(0.0))
+    )
+}
+
+/// A coordinate on the grid [`num`] prints on.
+fn quantize(v: f32) -> f32 {
+    if v.is_finite() { (v * 100.0).round() / 100.0 } else { 0.0 }
+}
+
 /// Two decimals is a fiftieth of a pixel -- below anything a renderer can
 /// show, and it keeps a 2000-point series to a readable file size.
 fn num(v: f32) -> String {
@@ -304,6 +380,19 @@ mod tests {
         let (hex, opacity) = paint(Color32::from_rgba_unmultiplied(0x11, 0x22, 0x33, 128));
         assert_eq!(hex.len(), 7, "{hex}");
         assert!(opacity.contains("0.5"), "{opacity}");
+    }
+
+    /// The seam this exists to prevent: two cells side by side, printed so
+    /// that one's right edge is the other's left edge to the last decimal.
+    #[test]
+    fn tiled_cells_share_their_edge_exactly() {
+        let first = Rect::from_min_max(Pos2::new(10.004, 0.0), Pos2::new(11.337, 5.0));
+        let second = Rect::from_min_max(Pos2::new(11.337, 0.0), Pos2::new(12.671, 5.0));
+        let (a, b) = (cell_geometry(first), cell_geometry(second));
+        let right_of_a = quantize(first.left()) + (quantize(first.right()) - quantize(first.left()));
+        assert_eq!(num(right_of_a), num(quantize(second.left())));
+        assert!(a.contains("x=\"10\"") && a.contains("width=\"1.34\""), "{a}");
+        assert!(b.contains("x=\"11.34\""), "{b}");
     }
 
     #[test]

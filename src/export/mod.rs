@@ -18,13 +18,13 @@ pub mod raster;
 pub mod svg;
 pub mod text;
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use egui::{Color32, Vec2};
 
 use crate::model::{Project, SourceKind};
 use crate::panes::{AxisMap, PlotAxis, PlotId, PlotSpec, Plots};
+use crate::tank::{TankId, TankSpec, Tanks};
 use crate::timeline::Timeline;
 
 pub use figure::LegendPos;
@@ -44,6 +44,27 @@ pub fn points_to_units(pt: f32) -> f32 {
 
 pub fn mm_to_pixels(mm: f32, dpi: f32) -> f32 {
     mm / MM_PER_INCH * dpi
+}
+
+/// A pane the exporter can put in a figure.
+///
+/// Graphs and tank panes both draw against the master timeline, which is what
+/// makes them stackable in one figure; the video and phase panes do not, and
+/// are not offered.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ExportItem {
+    Plot(PlotId),
+    Tank(TankId),
+}
+
+impl ExportItem {
+    /// What to call it in the picker and on the panel.
+    pub fn title(self, plots: &Plots, tanks: &Tanks) -> String {
+        match self {
+            Self::Plot(id) => plots.get(id).map_or_else(|| "plot".to_string(), PlotSpec::title),
+            Self::Tank(id) => tanks.get(id).map_or_else(|| "tank".to_string(), TankSpec::title),
+        }
+    }
 }
 
 /// Whether a time (or value) window is one anything can be drawn in.
@@ -217,7 +238,8 @@ impl ExportSettings {
 pub struct FigureRequest<'a> {
     pub project: &'a Project,
     pub plots: &'a Plots,
-    pub ids: &'a [PlotId],
+    pub tanks: &'a Tanks,
+    pub ids: &'a [ExportItem],
     pub range: (f64, f64),
     pub cursor: Option<f64>,
 }
@@ -229,16 +251,42 @@ pub struct FigureRequest<'a> {
 /// than any renderer can show at the sizes a page allows.
 pub fn build_figure(request: &FigureRequest<'_>, settings: &ExportSettings, width_units: f32) -> figure::Figure {
     let target_points = ((width_units * 2.0) as usize).clamp(500, 20_000);
+    // The same one-column-per-two-units the pane samples the tank at, so the
+    // exported strip is the strip on screen rather than a coarser or finer
+    // picture of the same data.
+    let columns = ((width_units * 0.5) as usize).clamp(2, 400);
     let panels = request
         .ids
         .iter()
-        .filter_map(|id| request.plots.get(*id))
-        .map(|plot| build_panel(request.project, plot, request.range, target_points, settings.auto_fit_y))
+        .filter_map(|item| match item {
+            ExportItem::Plot(id) => request.plots.get(*id).map(|plot| {
+                build_graph_panel(request.project, plot, request.range, target_points, settings.auto_fit_y)
+            }),
+            ExportItem::Tank(id) => request
+                .tanks
+                .get(*id)
+                .map(|tank| build_tank_panel(request.project, tank, request.range, columns)),
+        })
         .collect();
     figure::Figure {
         panels,
         range: request.range,
         cursor: request.cursor,
+    }
+}
+
+/// The tank pane as a panel: the pane's own sampling, ramp and modes, at the
+/// figure's size.
+fn build_tank_panel(project: &Project, spec: &TankSpec, range: (f64, f64), columns: usize) -> figure::Panel {
+    figure::Panel {
+        title: spec.title(),
+        content: figure::Content::Tank(figure::Tank {
+            field: spec.sample(project, range, columns),
+            lo_c: spec.lo_c,
+            hi_c: spec.hi_c,
+            blocks: spec.blocks,
+            grid: spec.grid,
+        }),
     }
 }
 
@@ -252,7 +300,7 @@ struct Prepared {
     bounds: Option<(f64, f64)>,
 }
 
-fn build_panel(
+fn build_graph_panel(
     project: &Project,
     plot: &PlotSpec,
     range: (f64, f64),
@@ -347,11 +395,13 @@ fn build_panel(
 
     figure::Panel {
         title: plot.title(),
-        series,
-        left,
-        right: right.filter(|_| has_right),
-        left_label,
-        right_label,
+        content: figure::Content::Graph(figure::Graph {
+            series,
+            left,
+            right: right.filter(|_| has_right),
+            left_label,
+            right_label,
+        }),
     }
 }
 
@@ -461,12 +511,6 @@ pub fn sanitize_file_name(title: &str) -> String {
     }
 }
 
-/// Which graphs the export dialog can offer: the ones with a pane open.
-pub fn visible_plots(pane_tiles: impl Iterator<Item = PlotId>, plots: &Plots) -> Vec<PlotId> {
-    let open: HashSet<PlotId> = pane_tiles.collect();
-    plots.iter().map(|p| p.id).filter(|id| open.contains(id)).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,13 +545,78 @@ mod tests {
         project
     }
 
-    fn two_plots(project: &Project) -> (Plots, Vec<PlotId>) {
+    /// The plot id behind an item, for reaching into `Plots` in a test.
+    fn plot_id(item: ExportItem) -> PlotId {
+        match item {
+            ExportItem::Plot(id) => id,
+            ExportItem::Tank(_) => panic!("not a graph"),
+        }
+    }
+
+    fn two_plots(project: &Project) -> (Plots, Vec<ExportItem>) {
         let source = project.sources[0].id;
         let mut plots = Plots::default();
         let a = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
         plots.add(a, source, "THRUST.force".to_string(), PlotAxis::Right);
         let b = plots.create(source, "THRUST.force".to_string());
-        (plots, vec![a, b])
+        (plots, vec![ExportItem::Plot(a), ExportItem::Plot(b)])
+    }
+
+    /// A tank whose ten heights are one row of sensor slots, warming over the
+    /// run so the strip has something in it.
+    fn project_with_a_tank() -> Project {
+        let mut project = Project::new();
+        let id = project.alloc_id();
+        let series: Vec<TimeSeries> = (0..crate::tank::TANK_SENSORS)
+            .map(|sensor| {
+                let points: Vec<[f64; 2]> = (0..200)
+                    .map(|i| [i as f64 * 0.25, -10.0 + sensor as f64 * 4.0 + i as f64 * 0.05])
+                    .collect();
+                TimeSeries::from_points(format!("CAN_SENSOR[6].slot{sensor}"), points).with_unit(Some("°C".into()))
+            })
+            .collect();
+        project.sources.push(Source {
+            id,
+            name: "tank.tlog".into(),
+            path: "tank.tlog".into(),
+            offset_seconds: 0.0,
+            color: Color32::WHITE,
+            enabled: true,
+            kind: SourceKind::Log(LogSource {
+                series,
+                format: LogFormat::Tlog,
+                can: Default::default(),
+            }),
+        });
+        project
+    }
+
+    /// Writes one figure, for a test that has to re-borrow the panes between
+    /// exports.
+    fn export_at(
+        project: &Project,
+        plots: &Plots,
+        tanks: &Tanks,
+        ids: &[ExportItem],
+        settings: &ExportSettings,
+        path: &Path,
+    ) {
+        let request = FigureRequest {
+            project,
+            plots,
+            tanks,
+            ids,
+            range: (0.0, 50.0),
+            cursor: Some(10.0),
+        };
+        export(&request, settings, path).expect("the figure was written");
+    }
+
+    fn graph_of(figure: &figure::Figure, panel: usize) -> &figure::Graph {
+        match &figure.panels[panel].content {
+            figure::Content::Graph(graph) => graph,
+            figure::Content::Tank(_) => panic!("panel {panel} is a tank, not a graph"),
+        }
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -524,40 +633,42 @@ mod tests {
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
-        let panel = &figure.panels[0];
-        assert_eq!(panel.left_label, "bar");
-        assert_eq!(panel.right_label, "N");
-        let right = panel.right.expect("a right axis");
+        let graph = graph_of(&figure, 0);
+        assert_eq!(graph.left_label, "bar");
+        assert_eq!(graph.right_label, "N");
+        let right = graph.right.expect("a right axis");
         // Each axis covers its own series, in its own units -- the export
         // draws two axes rather than squeezing one into the other.
         assert!(right.0 < -7500.0 && right.1 > 7500.0, "{right:?}");
-        assert!(panel.left.0 > 30.0 && panel.left.1 < 50.0, "{:?}", panel.left);
-        assert!(panel.series.iter().any(|s| s.right_axis && s.label.ends_with("(R)")));
+        assert!(graph.left.0 > 30.0 && graph.left.1 < 50.0, "{:?}", graph.left);
+        assert!(graph.series.iter().any(|s| s.right_axis && s.label.ends_with("(R)")));
     }
 
     #[test]
     fn normalizing_puts_every_series_on_one_axis() {
         let project = project();
         let (mut plots, ids) = two_plots(&project);
-        plots.get_mut(ids[0]).unwrap().normalize = true;
+        plots.get_mut(plot_id(ids[0])).unwrap().normalize = true;
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
-        let panel = &figure.panels[0];
-        assert_eq!(panel.left_label, "normalized");
-        assert!(panel.right.is_none(), "nothing has its own axis when normalized");
-        assert!(panel.series.iter().all(|s| !s.right_axis));
-        for series in &panel.series {
+        let graph = graph_of(&figure, 0);
+        assert_eq!(graph.left_label, "normalized");
+        assert!(graph.right.is_none(), "nothing has its own axis when normalized");
+        assert!(graph.series.iter().all(|s| !s.right_axis));
+        for series in &graph.series {
             assert!(
                 series.points.iter().all(|p| (-0.01..=1.01).contains(&p[1])),
                 "{} left the 0..1 range",
@@ -573,17 +684,18 @@ mod tests {
     fn a_pinned_value_range_is_kept_unless_the_user_asks_for_a_fit() {
         let project = project();
         let (mut plots, ids) = two_plots(&project);
-        plots.get_mut(ids[0]).unwrap().y_manual = Some((39.0, 41.0));
+        plots.get_mut(plot_id(ids[0])).unwrap().y_manual = Some((39.0, 41.0));
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
         };
         let kept = build_figure(&request, &ExportSettings::default(), 600.0);
-        assert_eq!(kept.panels[0].left, (39.0, 41.0));
-        let right = kept.panels[0].right.expect("a right axis");
+        assert_eq!(graph_of(&kept, 0).left, (39.0, 41.0));
+        let right = graph_of(&kept, 0).right.expect("a right axis");
         assert!(right.1 - right.0 > 0.0);
 
         let fitted = build_figure(
@@ -594,8 +706,8 @@ mod tests {
             },
             600.0,
         );
-        assert_ne!(fitted.panels[0].left, (39.0, 41.0));
-        assert!(fitted.panels[0].left.0 < 36.0, "{:?}", fitted.panels[0].left);
+        assert_ne!(graph_of(&fitted, 0).left, (39.0, 41.0));
+        assert!(graph_of(&fitted, 0).left.0 < 36.0, "{:?}", graph_of(&fitted, 0).left);
     }
 
     #[test]
@@ -606,6 +718,7 @@ mod tests {
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids,
             range: (0.0, 50.0),
             cursor: Some(10.0),
@@ -642,6 +755,7 @@ mod tests {
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids,
             range: (0.0, 50.0),
             cursor: None,
@@ -668,6 +782,7 @@ mod tests {
         let request = FigureRequest {
             project: &empty_project,
             plots: &no_plots,
+            tanks: &Tanks::default(),
             ids: &[],
             range: (0.0, 1.0),
             cursor: None,
@@ -679,6 +794,7 @@ mod tests {
         let backwards = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &ids,
             range: (50.0, 0.0),
             cursor: None,
@@ -695,24 +811,126 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The tank pane's whole point is the picture, so the test is that the
+    /// picture comes out: a field with the stratification in it, drawn as
+    /// gradients (shaded) or flat rectangles (blocks), and ink on the page
+    /// where the strip is.
+    #[test]
+    fn a_tank_pane_exports_the_strip_it_draws() {
+        let project = project_with_a_tank();
+        let plots = Plots::default();
+        let mut tanks = Tanks::default();
+        let id = tanks.create(&project);
+        let ids = [ExportItem::Tank(id)];
+        let dir = temp_dir("tank");
+        let settings = ExportSettings::default();
+
+        let figure = {
+            let request = FigureRequest {
+                project: &project,
+                plots: &plots,
+                tanks: &tanks,
+                ids: &ids,
+                range: (0.0, 50.0),
+                cursor: Some(10.0),
+            };
+            build_figure(&request, &settings, 600.0)
+        };
+        let figure::Content::Tank(tank) = &figure.panels[0].content else {
+            panic!("a tank pane exports a tank");
+        };
+        assert!(figure.panels[0].title.starts_with("Tank"));
+        assert!(!tank.field.is_empty(), "nothing landed in the window");
+        assert!(tank.field.cols > 2);
+        // Bottom cold, top warm -- the wall as the log has it, and the thing
+        // the picture exists to show.
+        let top = tank.field.at(tank.field.cols / 2, crate::tank::TANK_SENSORS - 1);
+        let bottom = tank.field.at(tank.field.cols / 2, 0);
+        assert!(top > bottom + 20.0, "{bottom} .. {top}");
+
+        // Shaded: one gradient per column, which is what keeps the SVG an
+        // interpolation rather than a stack of bands.
+        let path = dir.join("tank.svg");
+        export_at(&project, &plots, &tanks, &ids, &settings, &path);
+        let svg = std::fs::read_to_string(&path).unwrap();
+        // One gradient per column of the strip, plus the colour bar.
+        assert!(svg.matches("<linearGradient").count() > 10, "the shading");
+        assert!(svg.contains(">s0<") && svg.contains(">s9<"), "the heights are named");
+        assert!(svg.contains("°C"), "the colour bar says what it is in");
+
+        // Blocks: flat rectangles, no gradients at all.
+        tanks.get_mut(id).unwrap().blocks = true;
+        let path = dir.join("blocks.svg");
+        export_at(&project, &plots, &tanks, &ids, &settings, &path);
+        let blocks = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            blocks.matches("<linearGradient").count(),
+            1,
+            "blocks mode interpolates nothing -- the only gradient left is the colour bar"
+        );
+        assert!(blocks.matches("<rect").count() > 10, "one rectangle per region");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ... and the same picture in pixels: the strip is painted, and the
+    /// vessel is not left as an empty box.
+    #[test]
+    fn a_tank_figure_puts_ink_where_the_strip_is() {
+        let project = project_with_a_tank();
+        let plots = Plots::default();
+        let tanks = {
+            let mut tanks = Tanks::default();
+            tanks.create(&project);
+            tanks
+        };
+        let ids = [ExportItem::Tank(0)];
+        let settings = ExportSettings::default();
+        let request = FigureRequest {
+            project: &project,
+            plots: &plots,
+            tanks: &tanks,
+            ids: &ids,
+            range: (0.0, 50.0),
+            cursor: None,
+        };
+        let size = settings.size_units(1);
+        let figure = build_figure(&request, &settings, size.x);
+        let mut canvas = raster::RasterCanvas::new(size, 1.0).unwrap();
+        figure::draw(&mut canvas, &figure, &settings.style());
+        let (width, _, rgba) = canvas.into_rgba();
+
+        // The middle of the figure is inside the strip, and the strip is
+        // coloured -- not the white page, and not the grey of a hole.
+        let index = |x: usize, y: usize| (y * width + x) * 4;
+        let middle = index(width / 2, (size.y * 0.5) as usize);
+        let (r, g, b) = (rgba[middle], rgba[middle + 1], rgba[middle + 2]);
+        assert!(
+            r.abs_diff(b) > 20,
+            "the middle of the strip should carry the ramp, got #{r:02x}{g:02x}{b:02x}"
+        );
+    }
+
     /// A graph whose source was unloaded, and one whose series is gone: the
     /// exporter drops what it cannot find rather than inventing it.
     #[test]
     fn a_graph_naming_a_series_that_is_gone_exports_an_empty_panel() {
         let project = project();
         let mut plots = Plots::default();
-        let id = plots.create(99, "NOT_IMPORTED.field".to_string());
+        let id = ExportItem::Plot(plots.create(99, "NOT_IMPORTED.field".to_string()));
         let request = FigureRequest {
             project: &project,
             plots: &plots,
+            tanks: &Tanks::default(),
             ids: &[id],
             range: (0.0, 50.0),
             cursor: None,
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
         assert_eq!(figure.panels.len(), 1);
-        assert!(figure.panels[0].series.is_empty());
-        assert!(figure.panels[0].left.1 > figure.panels[0].left.0, "still a usable axis");
+        let graph = graph_of(&figure, 0);
+        assert!(graph.series.is_empty());
+        assert!(graph.left.1 > graph.left.0, "still a usable axis");
     }
 
     #[test]

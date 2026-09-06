@@ -463,6 +463,11 @@ pub struct Tanks {
 }
 
 impl Tanks {
+    /// Every open pane, in the order they were opened.
+    pub fn iter(&self) -> impl Iterator<Item = &TankSpec> {
+        self.list.iter()
+    }
+
     pub fn get(&self, id: TankId) -> Option<&TankSpec> {
         self.list.iter().find(|t| t.id == id)
     }
@@ -964,7 +969,7 @@ impl TankSpec {
                     .map(|sensor| sensor_band(sensor, body.top(), body.bottom()).1)
                     .collect()
             } else {
-                (0..TANK_SENSORS).map(|s| y_of(s, body)).collect()
+                (0..TANK_SENSORS).map(|s| sensor_y(s, body)).collect()
             };
             for y in lines {
                 painter.line_segment([Pos2::new(body.left(), y), Pos2::new(body.right(), y)], paint.grid);
@@ -1002,7 +1007,7 @@ impl TankSpec {
                 } else {
                     heat_colour(c, self.lo_c, self.hi_c)
                 };
-                mesh.colored_vertex(Pos2::new(x_of(col), y_of(sensor, body)), colour);
+                mesh.colored_vertex(Pos2::new(x_of(col), sensor_y(sensor, body)), colour);
             }
         }
 
@@ -1083,7 +1088,7 @@ impl TankSpec {
         );
 
         for (sensor, reading) in readings.iter().enumerate() {
-            let y = y_of(sensor, body);
+            let y = sensor_y(sensor, body);
             let swatch = Rect::from_min_size(Pos2::new(x, y - 5.0), egui::vec2(10.0, 10.0));
             match *reading {
                 Some(c) => {
@@ -1231,7 +1236,13 @@ impl TankSpec {
 }
 
 /// The screen height sensor `sensor` is measured at.
-fn y_of(sensor: usize, body: Rect) -> f32 {
+/// The height a sensor sits at, bottom first: sensor 0 is `body.bottom()` and
+/// the last one `body.top()`.
+///
+/// Shared with the figure exporter (`crate::export`), which draws the same
+/// picture at a different size -- the heights have to be the same division of
+/// the vessel there or the exported tank would be a different tank.
+pub(crate) fn sensor_y(sensor: usize, body: Rect) -> f32 {
     body.bottom() - body.height() * sensor as f32 / (TANK_SENSORS - 1) as f32
 }
 
@@ -1243,7 +1254,7 @@ fn y_of(sensor: usize, body: Rect) -> f32 {
 /// Together the bands tile the vessel exactly -- no overlap, no seam -- which
 /// is the property `the_bands_tile_the_tank_exactly` holds them to and the
 /// whole reason this mode exists.
-fn sensor_band(sensor: usize, top: f32, bottom: f32) -> (f32, f32) {
+pub(crate) fn sensor_band(sensor: usize, top: f32, bottom: f32) -> (f32, f32) {
     let y = |s: usize| bottom - (bottom - top) * s as f32 / (TANK_SENSORS - 1) as f32;
     let upper = if sensor + 1 >= TANK_SENSORS {
         top
@@ -1262,7 +1273,7 @@ fn sensor_band(sensor: usize, top: f32, bottom: f32) -> (f32, f32) {
 /// half way back to the one before it to half way on to the one after. The
 /// first and last columns therefore reach the edges of the window they are the
 /// edges of.
-fn column_cell(col: usize, cols: usize, left: f32, right: f32) -> (f32, f32) {
+pub(crate) fn column_cell(col: usize, cols: usize, left: f32, right: f32) -> (f32, f32) {
     let x = |c: usize| left + (right - left) * c as f32 / (cols - 1).max(1) as f32;
     let start = if col == 0 { left } else { (x(col) + x(col - 1)) / 2.0 };
     let end = if col + 1 >= cols { right } else { (x(col) + x(col + 1)) / 2.0 };
@@ -1292,7 +1303,7 @@ fn caps(painter: &egui::Painter, body: Rect, cap_h: f32, paint: Paint) {
 fn gutter(painter: &egui::Painter, body: Rect, paint: Paint) {
     for sensor in 0..TANK_SENSORS {
         painter.text(
-            Pos2::new(body.left() - 4.0, y_of(sensor, body)),
+            Pos2::new(body.left() - 4.0, sensor_y(sensor, body)),
             Align2::RIGHT_CENTER,
             format!("s{sensor}"),
             FontId::monospace(10.0),
@@ -1691,7 +1702,7 @@ mod tests {
         }
         let body = Rect::from_min_max(Pos2::new(0.0, top), Pos2::new(100.0, bottom));
         for (sensor, band) in bands.iter().enumerate() {
-            let y = y_of(sensor, body);
+            let y = sensor_y(sensor, body);
             assert!(band.0 <= y && y <= band.1, "sensor {sensor} is not in its band");
         }
     }

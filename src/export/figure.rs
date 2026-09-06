@@ -23,6 +23,24 @@ pub trait Canvas {
     /// An open polyline. Fewer than two points draws nothing.
     fn polyline(&mut self, points: &[Pos2], color: Color32, width: f32);
 
+    /// One cell of a grid of them, filled flat.
+    ///
+    /// Unlike [`Canvas::fill_rect`] the edges are *not* anti-aliased: two
+    /// cells sharing an edge would each cover their side of it partially, and
+    /// the background would show through the seam as a hairline. A heat map
+    /// made of a few hundred of those is a picture of stripes.
+    fn fill_cell(&mut self, rect: Rect, color: Color32);
+
+    /// A rectangle filled with a top-to-bottom gradient: `stops` are
+    /// `(distance down the rect, 0..1; colour)`, in order. Its edges are
+    /// crisp, for the same reason [`Canvas::fill_cell`]'s are.
+    ///
+    /// This exists for the tank strip, where the colour between two sensors is
+    /// an interpolation and drawing it as a stack of flat bands would put
+    /// edges in the picture that the data does not have. A gradient stays an
+    /// interpolation in the SVG too, at whatever resolution it is printed at.
+    fn vertical_gradient(&mut self, rect: Rect, stops: &[(f32, Color32)]);
+
     /// One line of text, positioned by which of its corners/edges `align`
     /// names sitting at `anchor`.
     fn text(&mut self, anchor: Pos2, align: Align2, text: &str, size: f32, color: Color32);
@@ -48,10 +66,31 @@ pub struct Series {
     pub points: Vec<[f64; 2]>,
 }
 
-/// One graph in the figure. A figure with several stacks them on a shared
-/// time axis, which is the whole reason for exporting more than one at once.
+/// One pane in the figure. A figure with several stacks them on a shared time
+/// axis, which is the whole reason for exporting more than one at once -- and
+/// why a tank is a panel here rather than a picture of its own: the point of
+/// putting it under a chamber pressure is reading the two against each other.
 pub struct Panel {
     pub title: String,
+    pub content: Content,
+}
+
+pub enum Content {
+    Graph(Graph),
+    Tank(Tank),
+}
+
+impl Panel {
+    fn graph(&self) -> Option<&Graph> {
+        match &self.content {
+            Content::Graph(graph) => Some(graph),
+            Content::Tank(_) => None,
+        }
+    }
+}
+
+/// Any number of series against one or two value axes.
+pub struct Graph {
     pub series: Vec<Series>,
     pub left: (f64, f64),
     /// `None` when nothing is drawn against a second axis.
@@ -60,10 +99,28 @@ pub struct Panel {
     pub right_label: String,
 }
 
-impl Panel {
+impl Graph {
     fn has_right(&self) -> bool {
         self.right.is_some() && self.series.iter().any(|s| s.right_axis)
     }
+}
+
+/// The tank wall as the pane draws it: one temperature per sensor per moment,
+/// colour for temperature, height up the panel.
+///
+/// The field is [`crate::tank::Field`] itself rather than a copy of it, so the
+/// figure is sampled by the same code the pane samples with -- including the
+/// hold that decides where the strip has holes in it.
+pub struct Tank {
+    pub field: crate::tank::Field,
+    /// Ends of the colour ramp, in °C.
+    pub lo_c: f64,
+    pub hi_c: f64,
+    /// One flat rectangle per sensor per moment, instead of shading between
+    /// neighbours.
+    pub blocks: bool,
+    /// A line at each sensor's height.
+    pub grid: bool,
 }
 
 pub struct Figure {
@@ -110,6 +167,10 @@ pub struct Style {
 pub struct Palette {
     pub bg: Color32,
     pub plot_bg: Color32,
+    /// Inside the tank, where nothing was measured. Distinct from the page,
+    /// or a dropout would look like a hole in the *vessel* rather than in the
+    /// data.
+    pub hole: Color32,
     pub frame: Color32,
     pub grid: Color32,
     pub text: Color32,
@@ -123,6 +184,7 @@ impl Palette {
         Self {
             bg: Color32::WHITE,
             plot_bg: Color32::WHITE,
+            hole: Color32::from_gray(0xEE),
             frame: Color32::from_gray(0x55),
             grid: Color32::from_gray(0xDD),
             text: Color32::from_gray(0x20),
@@ -136,6 +198,7 @@ impl Palette {
         Self {
             bg: Color32::from_gray(0x1B),
             plot_bg: Color32::from_gray(0x11),
+            hole: Color32::from_gray(0x0A),
             frame: Color32::from_gray(0x77),
             grid: Color32::from_gray(0x33),
             text: Color32::from_gray(0xEE),
@@ -148,6 +211,7 @@ impl Palette {
     pub fn transparent(mut self) -> Self {
         self.bg = Color32::TRANSPARENT;
         self.plot_bg = Color32::TRANSPARENT;
+        self.hole = Color32::TRANSPARENT;
         self
     }
 }
@@ -198,9 +262,20 @@ pub fn draw(canvas: &mut dyn Canvas, figure: &Figure, style: &Style) {
     let ticks: Vec<ValueTicks> = figure
         .panels
         .iter()
-        .map(|panel| ValueTicks {
-            left: value_ticks(panel.left, provisional_h, m.line_h * 2.6),
-            right: panel.right.map(|r| value_ticks(r, provisional_h, m.line_h * 2.6)),
+        .map(|panel| match panel.graph() {
+            Some(graph) => ValueTicks {
+                left: value_ticks(graph.left, provisional_h, m.line_h * 2.6),
+                right: graph.right.map(|r| value_ticks(r, provisional_h, m.line_h * 2.6)),
+            },
+            // A tank's vertical axis is the ten sensors, which are always the
+            // same ten and need no choosing.
+            None => ValueTicks {
+                left: Ticks {
+                    step: 1.0,
+                    labels: Vec::new(),
+                },
+                right: None,
+            },
         })
         .collect();
 
@@ -209,11 +284,17 @@ pub fn draw(canvas: &mut dyn Canvas, figure: &Figure, style: &Style) {
     let mut left_margin: f32 = m.half_time_label;
     let mut right_margin: f32 = m.half_time_label;
     for (panel, t) in figure.panels.iter().zip(&ticks) {
-        let axis = m.axis_margin(canvas, &t.left, &panel.left_label);
-        left_margin = left_margin.max(axis);
-        if let (Some(right), true) = (&t.right, panel.has_right()) {
-            let axis = m.axis_margin(canvas, right, &panel.right_label);
-            right_margin = right_margin.max(axis);
+        match &panel.content {
+            Content::Graph(graph) => {
+                left_margin = left_margin.max(m.axis_margin(canvas, &t.left, &graph.left_label));
+                if let (Some(right), true) = (&t.right, graph.has_right()) {
+                    right_margin = right_margin.max(m.axis_margin(canvas, right, &graph.right_label));
+                }
+            }
+            Content::Tank(tank) => {
+                left_margin = left_margin.max(m.tank_left_margin(canvas));
+                right_margin = right_margin.max(m.tank_right_margin(canvas, tank));
+            }
         }
     }
     if content.width() - left_margin - right_margin < MIN_PLOT_SIDE {
@@ -232,10 +313,9 @@ pub fn draw(canvas: &mut dyn Canvas, figure: &Figure, style: &Style) {
 
     for (i, (panel, t)) in figure.panels.iter().zip(&ticks).enumerate() {
         let top = content.top() + i as f32 * (panel_h + panel_gap);
-        let legend_h = if style.legend == LegendPos::Below {
-            legend_below_height(canvas, panel, &m, plot_right - plot_left)
-        } else {
-            0.0
+        let legend_h = match (style.legend, panel.graph()) {
+            (LegendPos::Below, Some(graph)) => legend_below_height(canvas, graph, &m, plot_right - plot_left),
+            _ => 0.0,
         };
         let plot_top = top + m.title_block;
         let plot_bottom = (top + panel_h - legend_h).max(plot_top + MIN_PLOT_SIDE);
@@ -251,19 +331,25 @@ pub fn draw(canvas: &mut dyn Canvas, figure: &Figure, style: &Style) {
             );
         }
 
-        draw_panel(canvas, figure, panel, t, &time, plot, &m);
+        match &panel.content {
+            Content::Graph(graph) => draw_graph(canvas, figure, graph, t, &time, plot, &m),
+            Content::Tank(tank) => draw_tank(canvas, figure, tank, plot, &m),
+        }
 
         // After the lines: a legend that went under them would be unreadable
-        // exactly where the graph is busiest.
-        match style.legend {
-            LegendPos::Off => {}
-            LegendPos::TopLeft => draw_legend_inside(canvas, panel, &m, plot, false),
-            LegendPos::TopRight => draw_legend_inside(canvas, panel, &m, plot, true),
-            // On the bottom panel the time axis is between the graph and
-            // the legend, so the legend goes below that rather than over it.
-            LegendPos::Below => {
-                let below_axis = if i + 1 == n { m.x_axis_block } else { 0.0 };
-                draw_legend_below(canvas, panel, &m, plot, legend_h, below_axis)
+        // exactly where the graph is busiest. A tank has no series legend --
+        // the colour bar beside it is the legend.
+        if let Some(graph) = panel.graph() {
+            match style.legend {
+                LegendPos::Off => {}
+                LegendPos::TopLeft => draw_legend_inside(canvas, graph, &m, plot, false),
+                LegendPos::TopRight => draw_legend_inside(canvas, graph, &m, plot, true),
+                // On the bottom panel the time axis is between the graph and
+                // the legend, so the legend goes below that rather than over it.
+                LegendPos::Below => {
+                    let below_axis = if i + 1 == n { m.x_axis_block } else { 0.0 };
+                    draw_legend_below(canvas, graph, &m, plot, legend_h, below_axis)
+                }
             }
         }
 
@@ -320,6 +406,20 @@ impl<'a> Metrics<'a> {
         }
     }
 
+    /// Room the sensor names down the left of a tank need.
+    fn tank_left_margin(&self, canvas: &mut dyn Canvas) -> f32 {
+        text_room(canvas, "s0", self.style.font) + self.gap
+    }
+
+    /// Room the colour bar and its two labels need on the right of a tank.
+    fn tank_right_margin(&self, canvas: &mut dyn Canvas, tank: &Tank) -> f32 {
+        let widest = [tank.hi_c, tank.lo_c]
+            .iter()
+            .map(|c| text_room(canvas, &tank_scale_label(*c), self.style.font))
+            .fold(0.0_f32, f32::max);
+        self.gap + self.style.font * 1.1 + self.gap * 0.5 + widest
+    }
+
     /// Room a value axis needs: its tick labels, the marks, and the rotated
     /// unit label outside them.
     fn axis_margin(&self, canvas: &mut dyn Canvas, ticks: &Ticks, label: &str) -> f32 {
@@ -345,10 +445,10 @@ pub struct Ticks {
     pub labels: Vec<(f64, String)>,
 }
 
-fn draw_panel(
+fn draw_graph(
     canvas: &mut dyn Canvas,
     figure: &Figure,
-    panel: &Panel,
+    graph: &Graph,
     ticks: &ValueTicks,
     time: &Ticks,
     plot: Rect,
@@ -370,18 +470,18 @@ fn draw_panel(
             canvas.polyline(&[pos2(x, plot.top()), pos2(x, plot.bottom())], p.grid, w);
         }
         for (v, _) in &ticks.left.labels {
-            let y = y_of(*v, panel.left);
+            let y = y_of(*v, graph.left);
             canvas.polyline(&[pos2(plot.left(), y), pos2(plot.right(), y)], p.grid, w);
         }
     }
 
     // --- the lines themselves ---
     canvas.clip(Some(plot));
-    for series in &panel.series {
+    for series in &graph.series {
         let range = if series.right_axis {
-            panel.right.unwrap_or(panel.left)
+            graph.right.unwrap_or(graph.left)
         } else {
-            panel.left
+            graph.left
         };
         // A gap in the data is a gap in the line: a run ends wherever a
         // sample is missing rather than being bridged across it.
@@ -412,11 +512,238 @@ fn draw_panel(
     canvas.stroke_rect(plot, p.frame, (style.line_width * 0.6).max(0.5));
 
     // --- value axes ---
-    draw_value_axis(canvas, &ticks.left, panel.left, &panel.left_label, plot, m, false);
-    if let (Some(right_ticks), Some(range)) = (&ticks.right, panel.right)
-        && panel.has_right()
+    draw_value_axis(canvas, &ticks.left, graph.left, &graph.left_label, plot, m, false);
+    if let (Some(right_ticks), Some(range)) = (&ticks.right, graph.right)
+        && graph.has_right()
     {
-        draw_value_axis(canvas, right_ticks, range, &panel.right_label, plot, m, true);
+        draw_value_axis(canvas, right_ticks, range, &graph.right_label, plot, m, true);
+    }
+}
+
+/// The tank wall, drawn against the panel's plot rect so a tank stacked under
+/// a graph shares its time axis exactly.
+///
+/// This is the pane's picture ([`crate::tank`]) at the figure's own size: the
+/// same field, the same colour ramp, the same division of the vessel into
+/// heights. The vessel's dished ends are drawn *inside* the rect rather than
+/// outside it, so the strip lines up with the graphs above it rather than the
+/// vessel's outline doing.
+fn draw_tank(canvas: &mut dyn Canvas, figure: &Figure, tank: &Tank, plot: Rect, m: &Metrics<'_>) {
+    use crate::tank::TANK_SENSORS;
+
+    let style = m.style;
+    let p = &style.palette;
+    let stroke = (style.line_width * 0.6).max(0.5);
+    let cap_h = (plot.width() * 0.06)
+        .clamp(m.line_h * 0.4, m.line_h * 1.4)
+        .min(plot.height() * 0.2);
+    let body = Rect::from_min_max(
+        pos2(plot.left(), plot.top() + cap_h),
+        pos2(plot.right(), plot.bottom() - cap_h),
+    );
+    if body.height() < MIN_PLOT_SIDE * 0.5 {
+        return;
+    }
+
+    // Everything with no reading keeps this, so a dropout is a hole in the
+    // picture rather than a temperature nobody measured.
+    canvas.fill_rect(body, p.hole);
+    canvas.clip(Some(body));
+    if tank.blocks {
+        draw_tank_blocks(canvas, tank, body);
+    } else {
+        draw_tank_shading(canvas, tank, body);
+    }
+    let (t0, t1) = figure.range;
+    if style.cursor
+        && let Some(cursor) = figure.cursor
+        && (t0..=t1).contains(&cursor)
+    {
+        let x = plot.left() + ((cursor - t0) / (t1 - t0)) as f32 * plot.width();
+        canvas.polyline(&[pos2(x, body.top()), pos2(x, body.bottom())], p.cursor, style.line_width);
+    }
+    canvas.clip(None);
+
+    // The dished ends, which are what make the strip read as a vessel seen
+    // from the side rather than as a bare heat map.
+    for (edge, dir) in [(body.top(), -1.0_f32), (body.bottom(), 1.0_f32)] {
+        const STEPS: usize = 24;
+        let (cx, rx) = (body.center().x, body.width() / 2.0);
+        let arc: Vec<Pos2> = (0..=STEPS)
+            .map(|i| {
+                let theta = std::f32::consts::PI * i as f32 / STEPS as f32;
+                pos2(cx - rx * theta.cos(), edge + dir * cap_h * theta.sin())
+            })
+            .collect();
+        canvas.polyline(&arc, p.frame, stroke);
+    }
+
+    // The pane's own setting, and the figure's: a figure with its grid turned
+    // off should not keep one because the pane it came from had one.
+    if tank.grid && style.grid {
+        // In blocks mode the line belongs on the seam between two sensors'
+        // regions, not through the middle of one -- the point of that mode is
+        // that a region is all one measurement.
+        let lines: Vec<f32> = if tank.blocks {
+            (1..TANK_SENSORS)
+                .map(|sensor| crate::tank::sensor_band(sensor, body.top(), body.bottom()).1)
+                .collect()
+        } else {
+            (0..TANK_SENSORS).map(|s| crate::tank::sensor_y(s, body)).collect()
+        };
+        for y in lines {
+            canvas.polyline(&[pos2(body.left(), y), pos2(body.right(), y)], p.grid, stroke * 0.8);
+        }
+    }
+    canvas.stroke_rect(body, p.frame, stroke);
+
+    // s9 at the top down to s0 at the bottom, against the heights they stand
+    // for -- the tank's value axis, and the reason it needs no ticks.
+    for sensor in 0..TANK_SENSORS {
+        canvas.text(
+            pos2(body.left() - m.gap * 0.4, crate::tank::sensor_y(sensor, body)),
+            Align2::RIGHT_CENTER,
+            &format!("s{sensor}"),
+            style.font,
+            p.weak_text,
+        );
+    }
+
+    draw_tank_scale(canvas, tank, body, plot.right() + m.gap, m);
+}
+
+/// The colour bar: the only thing that makes the picture a measurement rather
+/// than a pattern, so it is not optional the way a legend is.
+fn draw_tank_scale(canvas: &mut dyn Canvas, tank: &Tank, body: Rect, left: f32, m: &Metrics<'_>) {
+    let style = m.style;
+    let p = &style.palette;
+    let bar = Rect::from_min_max(pos2(left, body.top()), pos2(left + style.font * 1.1, body.bottom()));
+    if bar.height() <= 0.0 {
+        return;
+    }
+    // Nine stops land on all five of the ramp's own knots, so the bar is the
+    // ramp exactly rather than an approximation of it.
+    const STOPS: usize = 8;
+    let stops: Vec<(f32, Color32)> = (0..=STOPS)
+        .map(|i| {
+            let f = i as f32 / STOPS as f32;
+            let c = tank.hi_c + (tank.lo_c - tank.hi_c) * f as f64;
+            (f, crate::tank::heat_colour(c, tank.lo_c, tank.hi_c))
+        })
+        .collect();
+    canvas.vertical_gradient(bar, &stops);
+    canvas.stroke_rect(bar, p.frame, (style.line_width * 0.5).max(0.5));
+
+    let x = bar.right() + m.gap * 0.5;
+    canvas.text(
+        pos2(x, bar.top()),
+        Align2::LEFT_TOP,
+        &tank_scale_label(tank.hi_c),
+        style.font,
+        p.text,
+    );
+    canvas.text(
+        pos2(x, bar.bottom()),
+        Align2::LEFT_BOTTOM,
+        &tank_scale_label(tank.lo_c),
+        style.font,
+        p.text,
+    );
+
+    // The critical point: the one temperature on this scale that is a
+    // physical boundary rather than a preference.
+    if (tank.lo_c..=tank.hi_c).contains(&crate::tank::CRITICAL_C) {
+        let f = ((crate::tank::CRITICAL_C - tank.lo_c) / (tank.hi_c - tank.lo_c)) as f32;
+        let y = bar.bottom() - bar.height() * f;
+        canvas.polyline(
+            &[pos2(bar.left() - m.gap * 0.3, y), pos2(bar.right() + m.gap * 0.3, y)],
+            p.text,
+            (style.line_width * 0.8).max(0.5),
+        );
+        // ... but not its name when that would land on top of one of the
+        // bar's two end labels, which are the numbers it is read against.
+        // Half of "Tc" plus a whole end label: any closer and the two would
+        // be printed over each other.
+        if (y - bar.top()).min(bar.bottom() - y) > m.line_h * 1.5 {
+            canvas.text(pos2(x, y), Align2::LEFT_CENTER, "Tc", style.font, p.text);
+        }
+    }
+}
+
+fn tank_scale_label(c: f64) -> String {
+    format!("{c:.0} °C")
+}
+
+/// The field with no interpolation: one flat rectangle per sensor per moment,
+/// with columns that came out the same colour merged into one rectangle --
+/// which is most of them, and the difference between a readable SVG and one
+/// with ten thousand rectangles in it.
+fn draw_tank_blocks(canvas: &mut dyn Canvas, tank: &Tank, body: Rect) {
+    use crate::tank::TANK_SENSORS;
+    let field = &tank.field;
+    for sensor in 0..TANK_SENSORS {
+        let (top, bottom) = crate::tank::sensor_band(sensor, body.top(), body.bottom());
+        let mut run: Option<(f32, f32, Color32)> = None;
+        for col in 0..field.cols {
+            let (x0, x1) = crate::tank::column_cell(col, field.cols, body.left(), body.right());
+            let c = field.at(col, sensor);
+            let colour = (!c.is_nan()).then(|| crate::tank::heat_colour(c, tank.lo_c, tank.hi_c));
+            match (run, colour) {
+                (Some((start, end, held)), Some(colour)) if held == colour && (end - x0).abs() < 0.01 => {
+                    run = Some((start, x1, held));
+                }
+                (previous, colour) => {
+                    if let Some((start, end, held)) = previous {
+                        canvas.fill_cell(Rect::from_min_max(pos2(start, top), pos2(end, bottom)), held);
+                    }
+                    run = colour.map(|colour| (x0, x1, colour));
+                }
+            }
+        }
+        if let Some((start, end, held)) = run {
+            canvas.fill_cell(Rect::from_min_max(pos2(start, top), pos2(end, bottom)), held);
+        }
+    }
+}
+
+/// The field shaded between neighbours, as one gradient per column.
+///
+/// The pane does this with a mesh the GPU interpolates; here each column is a
+/// rectangle with a colour stop at every sensor, which is the same
+/// interpolation and stays one in an SVG. A column is broken wherever a sensor
+/// said nothing, so a dropout ends the shading at the column it happened in.
+fn draw_tank_shading(canvas: &mut dyn Canvas, tank: &Tank, body: Rect) {
+    use crate::tank::TANK_SENSORS;
+    let field = &tank.field;
+    let mut stops: Vec<(f32, Color32)> = Vec::with_capacity(TANK_SENSORS);
+    for col in 0..field.cols {
+        let (x0, x1) = crate::tank::column_cell(col, field.cols, body.left(), body.right());
+        let mut run_start: Option<usize> = None;
+        for sensor in 0..=TANK_SENSORS {
+            let real = sensor < TANK_SENSORS && !field.at(col, sensor).is_nan();
+            match (real, run_start) {
+                (true, None) => run_start = Some(sensor),
+                (false, Some(start)) => {
+                    let end = sensor - 1;
+                    // A lone sensor with holes either side shades against
+                    // nothing; the pane leaves it blank too.
+                    if end > start {
+                        stops.clear();
+                        for s in (start..=end).rev() {
+                            let f = (end - s) as f32 / (end - start) as f32;
+                            stops.push((f, crate::tank::heat_colour(field.at(col, s), tank.lo_c, tank.hi_c)));
+                        }
+                        let rect = Rect::from_min_max(
+                            pos2(x0, crate::tank::sensor_y(end, body)),
+                            pos2(x1, crate::tank::sensor_y(start, body)),
+                        );
+                        canvas.vertical_gradient(rect, &stops);
+                    }
+                    run_start = None;
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -509,21 +836,21 @@ fn legend_entry_width(canvas: &mut dyn Canvas, label: &str, m: &Metrics<'_>) -> 
     m.style.font * 1.6 + m.gap * 0.5 + text_room(canvas, label, m.style.font)
 }
 
-fn legend_below_height(canvas: &mut dyn Canvas, panel: &Panel, m: &Metrics<'_>, width: f32) -> f32 {
-    if panel.series.is_empty() {
+fn legend_below_height(canvas: &mut dyn Canvas, graph: &Graph, m: &Metrics<'_>, width: f32) -> f32 {
+    if graph.series.is_empty() {
         return 0.0;
     }
-    let rows = legend_rows(canvas, panel, m, width).len();
+    let rows = legend_rows(canvas, graph, m, width).len();
     m.gap * 0.6 + rows as f32 * m.line_h
 }
 
 /// Legend entries wrapped into rows no wider than `width`.
-fn legend_rows(canvas: &mut dyn Canvas, panel: &Panel, m: &Metrics<'_>, width: f32) -> Vec<Vec<usize>> {
+fn legend_rows(canvas: &mut dyn Canvas, graph: &Graph, m: &Metrics<'_>, width: f32) -> Vec<Vec<usize>> {
     let spacing = m.gap * 1.5;
     let mut rows: Vec<Vec<usize>> = Vec::new();
     let mut row: Vec<usize> = Vec::new();
     let mut x = 0.0;
-    for (i, series) in panel.series.iter().enumerate() {
+    for (i, series) in graph.series.iter().enumerate() {
         let w = legend_entry_width(canvas, &series.label, m);
         if !row.is_empty() && x + w > width {
             rows.push(std::mem::take(&mut row));
@@ -540,7 +867,7 @@ fn legend_rows(canvas: &mut dyn Canvas, panel: &Panel, m: &Metrics<'_>, width: f
 
 fn draw_legend_below(
     canvas: &mut dyn Canvas,
-    panel: &Panel,
+    graph: &Graph,
     m: &Metrics<'_>,
     plot: Rect,
     height: f32,
@@ -549,12 +876,12 @@ fn draw_legend_below(
     if height <= 0.0 {
         return;
     }
-    let rows = legend_rows(canvas, panel, m, plot.width());
+    let rows = legend_rows(canvas, graph, m, plot.width());
     let mut y = plot.bottom() + below_axis + m.gap * 0.6;
     for row in rows {
         let mut x = plot.left();
         for i in row {
-            let series = &panel.series[i];
+            let series = &graph.series[i];
             draw_legend_entry(canvas, series, pos2(x, y), m);
             x += legend_entry_width(canvas, &series.label, m) + m.gap * 1.5;
         }
@@ -580,18 +907,18 @@ fn draw_legend_entry(canvas: &mut dyn Canvas, series: &Series, top_left: Pos2, m
 }
 
 /// The legend as a box inside the plot area, which is where it costs no room.
-fn draw_legend_inside(canvas: &mut dyn Canvas, panel: &Panel, m: &Metrics<'_>, plot: Rect, right: bool) {
+fn draw_legend_inside(canvas: &mut dyn Canvas, graph: &Graph, m: &Metrics<'_>, plot: Rect, right: bool) {
     let style = m.style;
-    if panel.series.is_empty() {
+    if graph.series.is_empty() {
         return;
     }
-    let widest = panel
+    let widest = graph
         .series
         .iter()
         .map(|s| legend_entry_width(canvas, &s.label, m))
         .fold(0.0_f32, f32::max);
     let inner = m.gap * 0.5;
-    let size = vec2(widest + inner * 2.0, panel.series.len() as f32 * m.line_h + inner * 2.0);
+    let size = vec2(widest + inner * 2.0, graph.series.len() as f32 * m.line_h + inner * 2.0);
     if size.x > plot.width() || size.y > plot.height() {
         // A legend bigger than the graph would hide the data it names.
         return;
@@ -604,7 +931,7 @@ fn draw_legend_inside(canvas: &mut dyn Canvas, panel: &Panel, m: &Metrics<'_>, p
     let rect = Rect::from_min_size(pos2(x, plot.top() + m.gap), size);
     canvas.fill_rect(rect, style.palette.plot_bg.gamma_multiply(0.85));
     canvas.stroke_rect(rect, style.palette.grid, (style.line_width * 0.5).max(0.5));
-    for (i, series) in panel.series.iter().enumerate() {
+    for (i, series) in graph.series.iter().enumerate() {
         draw_legend_entry(
             canvas,
             series,

@@ -14,6 +14,7 @@ use egui_tiles::{Behavior as _, TileId};
 
 use rapid_analyzer::can::{CanFrame, CanFrames, FieldKind, SignalSpec};
 use rapid_analyzer::can_builder::CanBuilder;
+use rapid_analyzer::export::ExportItem;
 use rapid_analyzer::export::dialog::{DialogContext, ExportDialog};
 use rapid_analyzer::model::{LogFormat, LogSource, Project, Source, SourceKind};
 use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior};
@@ -541,11 +542,13 @@ fn the_export_window_draws_and_previews_the_figure() {
     let a = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
     plots.add(a, source, "THRUST.force".to_string(), PlotAxis::Right);
     let b = plots.create(source, "THRUST.force".to_string());
+    let items = [ExportItem::Plot(a), ExportItem::Plot(b)];
+    let tanks = Tanks::default();
     let mut timeline = Timeline::new(project.time_bounds().unwrap());
     timeline.cursor = 12.0;
 
     let mut dialog = ExportDialog::default();
-    dialog.open(&[a, b]);
+    dialog.open(&items);
     assert!(dialog.is_open());
 
     let ctx = egui::Context::default();
@@ -555,8 +558,9 @@ fn the_export_window_draws_and_previews_the_figure() {
             let cx = DialogContext {
                 project: &project,
                 plots: &plots,
+                tanks: &tanks,
                 timeline: &timeline,
-                visible: vec![a, b],
+                visible: items.to_vec(),
             };
             dialog.show(ui.ctx(), &cx);
         });
@@ -569,8 +573,56 @@ fn the_export_window_draws_and_previews_the_figure() {
         let cx = DialogContext {
             project: &project,
             plots: &plots,
+            tanks: &tanks,
             timeline: &timeline,
             visible: Vec::new(),
+        };
+        dialog.show(ui.ctx(), &cx);
+    });
+}
+
+/// A tank pane is exportable, and its preview goes through the whole tank
+/// painter -- the gradients, the vessel's ends, the colour bar -- at a size
+/// nothing else in the tests draws it at.
+#[test]
+fn the_export_window_previews_a_tank_pane() {
+    let mut project = project_with_a_tank_wall();
+    let plots = Plots::default();
+    let mut tanks = Tanks::default();
+    let tank = tanks.create(&project);
+    let items = [ExportItem::Tank(tank)];
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 120.0;
+
+    let mut dialog = ExportDialog::default();
+    dialog.open(&items);
+
+    let ctx = egui::Context::default();
+    for blocks in [false, true] {
+        tanks.get_mut(tank).unwrap().blocks = blocks;
+        draw_on(&ctx, |ui| {
+            let cx = DialogContext {
+                project: &project,
+                plots: &plots,
+                tanks: &tanks,
+                timeline: &timeline,
+                visible: items.to_vec(),
+            };
+            dialog.show(ui.ctx(), &cx);
+        });
+    }
+
+    // ... and with the log it was reading gone, which leaves the vessel with
+    // nothing in it rather than a division by an empty range.
+    project.sources.clear();
+    tanks.get_mut(tank).unwrap().forget_source(0);
+    draw_on(&ctx, |ui| {
+        let cx = DialogContext {
+            project: &project,
+            plots: &plots,
+            tanks: &tanks,
+            timeline: &timeline,
+            visible: items.to_vec(),
         };
         dialog.show(ui.ctx(), &cx);
     });
@@ -588,14 +640,16 @@ fn the_export_window_survives_a_range_with_no_data_in_it() {
     timeline.set_view(1e6, 1e6 + 10.0);
 
     let mut dialog = ExportDialog::default();
-    dialog.open(&[id]);
+    dialog.open(&[ExportItem::Plot(id)]);
     let ctx = egui::Context::default();
+    let tanks = Tanks::default();
     draw_on(&ctx, |ui| {
         let cx = DialogContext {
             project: &project,
             plots: &plots,
+            tanks: &tanks,
             timeline: &timeline,
-            visible: vec![id],
+            visible: vec![ExportItem::Plot(id)],
         };
         dialog.show(ui.ctx(), &cx);
     });

@@ -126,6 +126,21 @@ impl RasterCanvas {
         Ok(with_dpi(png.into_inner(), dpi))
     }
 
+    /// Figure units to device pixels.
+    fn to_device(&self, rect: Rect) -> Rect {
+        Rect::from_min_max(
+            pos2(rect.left() * self.scale, rect.top() * self.scale),
+            pos2(rect.right() * self.scale, rect.bottom() * self.scale),
+        )
+    }
+
+    /// The same, snapped to whole pixels: for cells that tile, so two of them
+    /// meet on a pixel boundary instead of sharing one.
+    fn to_device_snapped(&self, rect: Rect) -> Rect {
+        let device = self.to_device(rect);
+        Rect::from_min_max(device.min.round(), device.max.round())
+    }
+
     fn blend(&mut self, x: usize, y: usize, color: [f32; 4], coverage: f32) {
         if coverage <= 0.0 {
             return;
@@ -275,11 +290,7 @@ impl Canvas for RasterCanvas {
         if color.a() == 0 {
             return;
         }
-        let scaled = Rect::from_min_max(
-            pos2(rect.left() * self.scale, rect.top() * self.scale),
-            pos2(rect.right() * self.scale, rect.bottom() * self.scale),
-        );
-        self.fill_device_rect(scaled, premultiplied(color));
+        self.fill_device_rect(self.to_device(rect), premultiplied(color));
     }
 
     fn stroke_rect(&mut self, rect: Rect, color: Color32, width: f32) {
@@ -311,6 +322,43 @@ impl Canvas for RasterCanvas {
         }
     }
 
+    fn fill_cell(&mut self, rect: Rect, color: Color32) {
+        if color.a() == 0 {
+            return;
+        }
+        let device = self.to_device_snapped(rect);
+        let color = premultiplied(color);
+        let Some((x0, y0, x1, y1)) = self.bounds(device) else {
+            return;
+        };
+        for y in y0..y1 {
+            for x in x0..x1 {
+                self.blend(x, y, color, 1.0);
+            }
+        }
+    }
+
+    fn vertical_gradient(&mut self, rect: Rect, stops: &[(f32, Color32)]) {
+        if stops.is_empty() {
+            return;
+        }
+        // Snapped to whole pixels, like `fill_cell`: the gradient is one cell
+        // of the tank strip, and its neighbours have to meet it exactly.
+        let device = self.to_device_snapped(rect);
+        let Some((x0, y0, x1, y1)) = self.bounds(device) else {
+            return;
+        };
+        for y in y0..y1 {
+            // Sampled at the pixel's centre, so a stop lands where it says
+            // rather than half a pixel off.
+            let at = ((y as f32 + 0.5 - device.top()) / device.height().max(f32::EPSILON)).clamp(0.0, 1.0);
+            let color = premultiplied(sample_stops(stops, at));
+            for x in x0..x1 {
+                self.blend(x, y, color, 1.0);
+            }
+        }
+    }
+
     fn text(&mut self, anchor: Pos2, align: Align2, text: &str, size: f32, color: Color32) {
         if text.is_empty() || color.a() == 0 {
             return;
@@ -339,17 +387,36 @@ impl Canvas for RasterCanvas {
 
     fn clip(&mut self, rect: Option<Rect>) {
         self.clip = match rect {
-            Some(rect) => Rect::from_min_max(
-                pos2(rect.left() * self.scale, rect.top() * self.scale),
-                pos2(rect.right() * self.scale, rect.bottom() * self.scale),
-            )
-            .intersect(Rect::from_min_size(
+            Some(rect) => self
+                .to_device(rect)
+                .intersect(Rect::from_min_size(
                 Pos2::ZERO,
                 Vec2::new(self.width as f32, self.height as f32),
             )),
             None => Rect::from_min_size(Pos2::ZERO, Vec2::new(self.width as f32, self.height as f32)),
         };
     }
+}
+
+/// The colour a top-to-bottom gradient has `at` of the way down it.
+///
+/// Interpolated in gamma space, which is where `Color32::lerp_to_gamma` (what
+/// the pane's mesh interpolates in) and an SVG renderer's default both work,
+/// so the two backends and the screen agree.
+fn sample_stops(stops: &[(f32, Color32)], at: f32) -> Color32 {
+    let first = stops[0];
+    if at <= first.0 {
+        return first.1;
+    }
+    for pair in stops.windows(2) {
+        let ((a_at, a), (b_at, b)) = (pair[0], pair[1]);
+        if at <= b_at {
+            let span = b_at - a_at;
+            let f = if span.abs() < f32::EPSILON { 0.0 } else { (at - a_at) / span };
+            return a.lerp_to_gamma(b, f);
+        }
+    }
+    stops[stops.len() - 1].1
 }
 
 /// A [`Color32`] (premultiplied, gamma space) as floats.

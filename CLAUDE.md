@@ -148,6 +148,20 @@ the sidebar comes with it -- so the series are laid out a second time:
   units", CSS pixels at 96 to the inch, which is what an SVG `viewBox` is in;
   the raster backend scales by `dpi / 96`. One layout, one set of ticks, two
   files that agree.
+- A `Panel` is a graph *or* a tank (`figure::Content`), and both are laid out
+  against the same plot rect, which is what lets a stack of them share one
+  time axis. The tank panel is the pane's own picture redrawn at the figure's
+  size: `tank::Field` sampled by `TankSpec::sample`, and `tank::sensor_y` /
+  `sensor_band` / `column_cell` for the geometry, so the exported vessel is
+  divided exactly as the pane's is. Its shading is one vertical gradient per
+  column rather than a mesh, since that is what an SVG can carry.
+- Cells that tile -- the tank strip -- go through `Canvas::fill_cell` and
+  `vertical_gradient`, which are deliberately *not* anti-aliased: two
+  neighbours each covering their side of a shared edge let the background show
+  through as a hairline, and a few hundred of those is a picture of stripes.
+  The SVG backend also has to print the two cells' shared edge as the same
+  number (`svg::cell_geometry`), or a renderer snapping each to the pixel grid
+  reintroduces the seam.
 - `export/svg.rs` writes vector text. It cannot embed a font, so it names a
   font stack and *anchors* every string; `figure::TEXT_SLACK` is the few
   percent of extra room every measured label gets. That slack is applied in
