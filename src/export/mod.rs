@@ -321,18 +321,23 @@ fn build_graph_panel(
             continue;
         };
         let offset = source.offset_seconds;
-        let label = if multi_source {
+        let base = if multi_source {
             format!("{} [{}]", entry.series, source.name)
         } else {
             entry.series.clone()
         };
+        // A corrected line has to carry its correction into the report, where
+        // nobody can open the ⚙ menu to find out about it.
+        let label = entry.label_with_offset(&base, series.unit.as_deref());
+        let mut points = series.slice_for_range(t0, t1, offset, target_points);
+        entry.correct_points(&mut points);
         prepared.push(Prepared {
             label,
             color: entry.color,
             axis: entry.axis,
             unit: series.unit.clone(),
-            points: series.slice_for_range(t0, t1, offset, target_points),
-            bounds: series.value_bounds_in_range(t0, t1, offset),
+            points,
+            bounds: entry.correct_bounds(series.value_bounds_in_range(t0, t1, offset)),
         });
     }
 
@@ -809,6 +814,42 @@ mod tests {
         export(&elsewhere, &ExportSettings::default(), &dir.join("empty.svg")).unwrap();
         assert!(dir.join("empty.svg").exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sensor corrected in a graph is corrected in the figure of it -- and
+    /// the figure says so, because whoever reads the report was not there when
+    /// the correction was typed in.
+    #[test]
+    fn a_calibration_offset_moves_the_axis_and_is_named_in_the_legend() {
+        let project = project();
+        let (mut plots, ids) = two_plots(&project);
+        let figure_of = |plots: &Plots| {
+            let request = FigureRequest {
+                project: &project,
+                plots,
+                tanks: &Tanks::default(),
+                ids: &ids[..1],
+                range: (0.0, 50.0),
+                cursor: None,
+            };
+            build_figure(&request, &ExportSettings::default(), 600.0)
+        };
+        let raw = figure_of(&plots);
+        let raw_axis = graph_of(&raw, 0).left;
+        let raw_right = graph_of(&raw, 0).right;
+
+        plots.get_mut(plot_id(ids[0])).unwrap().entries[0].value_offset = 10.0;
+        let corrected = figure_of(&plots);
+        let graph = graph_of(&corrected, 0);
+        // The left axis is the pressure's; it moves with the correction, and
+        // the thrust on the right axis does not.
+        assert!((graph.left.0 - raw_axis.0 - 10.0).abs() < 1e-9, "{:?} vs {raw_axis:?}", graph.left);
+        assert!((graph.left.1 - raw_axis.1 - 10.0).abs() < 1e-9, "{:?} vs {raw_axis:?}", graph.left);
+        assert_eq!(graph.right, raw_right);
+
+        let pressure = &graph.series[0];
+        assert!(pressure.label.ends_with("(+10 bar)"), "{}", pressure.label);
+        assert!(pressure.points.iter().all(|p| p[1] > 34.0), "every sample moved up");
     }
 
     /// The tank pane's whole point is the picture, so the test is that the

@@ -39,6 +39,13 @@ zoomed together.
   button in the graph's ⚙ menu. "Line up both axes at zero" in the same menu
   puts both zeros at the same height, for two quantities that are only
   comparable when "nothing" is on the same line.
+- **Calibration offset**: a sensor that reads 10 bar low can be corrected in
+  the graph -- the ⚙ menu gives every series in it an `offset`, in that
+  series' own unit, added to every reading. It belongs to that graph, so the
+  same sensor stays raw everywhere else until it is corrected there too, and
+  the log itself is never changed. A corrected line says so in its own name
+  (`pressure1 (+10 bar)`), in the legend, the readout and an exported figure
+  alike.
 - **N₂O phase**: a pane that reads a temperature and a pressure series against
   the nitrous oxide vapour pressure curve and says which side of it the tank
   was on, at every instant -- see "Nitrous oxide phase" below.
@@ -453,6 +460,11 @@ from a real log.
   denser one's timestamps, and drops samples outside the other series' own
   time range rather than holding its first or last value. It covers nitrous
   oxide only; the curve is a property of the fluid, not a setting.
+- A calibration offset is per graph and per series, which is what makes it
+  possible to put the raw and the corrected line side by side -- but it also
+  means correcting a sensor in three graphs is three corrections. It does not
+  reach the N₂O phase or tank panes, which pick their own series, and it is
+  not saved: nothing in the app is.
 - The export covers graph and tank panes -- the two that are drawn against the
   master timeline. The video pane is not offered (it is a frame you already
   have a file of), nor is the N₂O phase pane, whose axes are a temperature and

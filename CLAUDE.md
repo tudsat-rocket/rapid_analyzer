@@ -256,6 +256,18 @@ optional manual y range. That is what lets one graph carry pressure and temperat
 Ticking a series in the sidebar opens a new plot; the ➕ menu next to it adds the series to an
 existing one.
 
+A `PlotEntry` also carries a `value_offset`: the correction for a sensor that
+reads high or low, in the series' own unit. It is applied through
+`PlotEntry::correct_points` / `correct_bounds` / `corrected` -- samples *and*
+the range they are drawn in, or the line leaves its own axis -- and both
+`panes::plot_pane` and `export::build_graph_panel` have to apply it, which is
+why those three live on the entry rather than at either call site. A corrected
+line is renamed by `label_with_offset` (`pressure1 (+10 bar)`): the same axis
+carries corrected and uncorrected lines, and an exported figure is read by
+someone who was not there when the number was typed in. That is also why the
+readout name comes from `field_of(&entry.series)` and not from the label -- a
+label can carry a file name and a correction, both of which have dots in them.
+
 egui_plot draws one coordinate system, so the **second y axis** is a mapping, not a second plot:
 right-axis series are squeezed into the left axis' auto range by `AxisMap` and the extra
 `AxisHints` relabels the ticks on the way out. The map is built from both sides' *auto* ranges

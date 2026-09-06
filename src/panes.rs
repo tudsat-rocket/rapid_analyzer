@@ -62,6 +62,60 @@ pub struct PlotEntry {
     pub series: String,
     pub color: Color32,
     pub axis: PlotAxis,
+    /// Added to every reading of this series, in the series' own unit: the
+    /// correction for a sensor that reads high or low.
+    ///
+    /// It belongs to the *entry* rather than to the series, so the same sensor
+    /// can be drawn raw in one graph and corrected in another -- which is how
+    /// you convince yourself of the correction in the first place. Nothing
+    /// below this is touched: the log keeps what it recorded.
+    pub value_offset: f64,
+}
+
+impl PlotEntry {
+    /// The correction applied to one reading.
+    pub(crate) fn corrected(&self, value: f64) -> f64 {
+        value + self.value_offset
+    }
+
+    /// ... to a slice of samples, in place.
+    pub(crate) fn correct_points(&self, points: &mut [[f64; 2]]) {
+        if self.value_offset == 0.0 {
+            return;
+        }
+        for point in points {
+            point[1] += self.value_offset;
+        }
+    }
+
+    /// ... and to a value range, which moves with them.
+    pub(crate) fn correct_bounds(&self, bounds: Option<(f64, f64)>) -> Option<(f64, f64)> {
+        bounds.map(|(lo, hi)| (lo + self.value_offset, hi + self.value_offset))
+    }
+
+    /// What the line is called once it is no longer showing what the log says.
+    ///
+    /// A corrected series has to say so on the line itself: it is drawn
+    /// against the same axis as the uncorrected ones, and an exported figure
+    /// is read by someone who was not there when the correction was typed in.
+    pub(crate) fn label_with_offset(&self, label: &str, unit: Option<&str>) -> String {
+        if self.value_offset == 0.0 {
+            return label.to_string();
+        }
+        format!("{label} ({})", offset_tag(self.value_offset, unit))
+    }
+}
+
+/// `10.0`, `Some("bar")` -> `"+10 bar"`.
+pub(crate) fn offset_tag(offset: f64, unit: Option<&str>) -> String {
+    let mut number = format!("{offset:+.3}");
+    if number.contains('.') {
+        number = number.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    match unit {
+        Some(unit) if !unit.is_empty() => format!("{number} {unit}"),
+        _ => number,
+    }
 }
 
 /// A graph pane: any number of series sharing one time axis.
@@ -159,6 +213,7 @@ impl Plots {
             series,
             color,
             axis,
+            value_offset: 0.0,
         });
         // A range picked for the old contents would just clip the new series.
         plot.y_manual = None;
@@ -270,6 +325,11 @@ pub struct TreeBehavior<'a> {
 /// so the drawing closure doesn't hold a borrow on it.
 struct PreparedSeries {
     label: String,
+    /// What the playhead readout calls it: the field on its own, plus any
+    /// correction. Kept beside `label` rather than cut out of it, because a
+    /// label carries a file name and a `(+10 bar)` that both have dots and
+    /// brackets in them.
+    short: String,
     color: Color32,
     unit: Option<String>,
     axis: PlotAxis,
@@ -445,24 +505,29 @@ impl<'a> TreeBehavior<'a> {
                 continue;
             };
             let offset = source.offset_seconds;
-            let mut label = if multi_source {
+            let base = if multi_source {
                 format!("{} [{}]", entry.series, source.name)
             } else {
                 entry.series.clone()
             };
+            // A correction has to be visible on the line it was applied to.
+            let mut label = entry.label_with_offset(&base, series.unit.as_deref());
             // Which axis a line is read against has to be visible on the line
             // itself; the numbers on the two sides are otherwise unattributable.
             if entry.axis == PlotAxis::Right {
                 label.push_str(" (R)");
             }
+            let mut points = series.slice_for_range(view_start, view_end, offset, TARGET_PLOT_POINTS);
+            entry.correct_points(&mut points);
             prepared.push(PreparedSeries {
                 label,
+                short: entry.label_with_offset(field_of(&entry.series), series.unit.as_deref()),
                 color: entry.color,
                 unit: series.unit.clone(),
                 axis: entry.axis,
-                points: series.slice_for_range(view_start, view_end, offset, TARGET_PLOT_POINTS),
-                bounds: series.value_bounds_in_range(view_start, view_end, offset),
-                at_cursor: series.value_at(cursor, offset),
+                points,
+                bounds: entry.correct_bounds(series.value_bounds_in_range(view_start, view_end, offset)),
+                at_cursor: series.value_at(cursor, offset).map(|v| entry.corrected(v)),
             });
         }
 
@@ -495,27 +560,21 @@ impl<'a> TreeBehavior<'a> {
                     ui.label("Series");
                     let mut drop = None;
                     let mut flip = None;
-                    for (i, entry) in plot.entries.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 2.0, entry.color);
-                            ui.label(&entry.series);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("✖").on_hover_text("Remove from this plot").clicked() {
-                                    drop = Some(i);
-                                }
-                                // The whole point of the right axis is a
-                                // series whose scale swamps the others, so
-                                // the switch belongs next to that series.
-                                if ui
-                                    .small_button(entry.axis.label())
-                                    .on_hover_text("Draw this against the left / right value axis")
-                                    .clicked()
-                                {
-                                    flip = Some(i);
-                                }
-                            });
-                        });
+                    let mut corrected = false;
+                    let project = &*self.project;
+                    for (i, entry) in plot.entries.iter_mut().enumerate() {
+                        let unit = series_unit(project, entry.source, &entry.series);
+                        match series_settings(ui, entry, unit.as_deref()) {
+                            SeriesAction::None => {}
+                            SeriesAction::Flip => flip = Some(i),
+                            SeriesAction::Drop => drop = Some(i),
+                            SeriesAction::Corrected => corrected = true,
+                        }
+                    }
+                    // A range pinned before the correction was typed in is a
+                    // range around where the series used to be.
+                    if corrected {
+                        plot.y_manual = None;
                     }
                     if let Some(i) = flip {
                         plot.entries[i].axis = plot.entries[i].axis.flipped();
@@ -536,7 +595,7 @@ impl<'a> TreeBehavior<'a> {
             for series in &prepared {
                 let Some(v) = series.at_cursor else { continue };
                 let unit = series.unit.as_deref().unwrap_or("");
-                ui.colored_label(series.color, format!("{}: {v:.4} {unit}", short_label(&series.label)));
+                ui.colored_label(series.color, format!("{}: {v:.4} {unit}", series.short));
             }
         });
 
@@ -893,6 +952,82 @@ fn short_title(name: &str) -> String {
     format!("{}…", name.chars().take(MAX - 1).collect::<String>())
 }
 
+/// What the user did to a series in a graph's ⚙ menu.
+#[derive(PartialEq, Eq, Debug)]
+enum SeriesAction {
+    None,
+    /// Draw it against the other value axis.
+    Flip,
+    /// Take it out of this graph.
+    Drop,
+    /// Its calibration offset was changed.
+    Corrected,
+}
+
+/// One series' row in a graph's ⚙ menu: colour, name, which axis, remove --
+/// and the offset that corrects a sensor reading high or low.
+///
+/// The correction sits here, next to the series it belongs to, because it is a
+/// property of *this line in this graph* and not of the log: the same sensor
+/// stays raw in every other graph until it is corrected there too.
+fn series_settings(ui: &mut egui::Ui, entry: &mut PlotEntry, unit: Option<&str>) -> SeriesAction {
+    let mut action = SeriesAction::None;
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, entry.color);
+        ui.label(&entry.series);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("✖").on_hover_text("Remove from this plot").clicked() {
+                action = SeriesAction::Drop;
+            }
+            // The whole point of the right axis is a series whose scale swamps
+            // the others, so the switch belongs next to that series.
+            if ui
+                .small_button(entry.axis.label())
+                .on_hover_text("Draw this against the left / right value axis")
+                .clicked()
+            {
+                action = SeriesAction::Flip;
+            }
+        });
+    });
+
+    ui.horizontal(|ui| {
+        ui.add_space(16.0);
+        ui.weak("offset");
+        let mut drag = egui::DragValue::new(&mut entry.value_offset).speed(0.05).max_decimals(4);
+        if let Some(unit) = unit.filter(|u| !u.is_empty()) {
+            drag = drag.suffix(format!(" {unit}"));
+        }
+        if ui
+            .add(drag)
+            .on_hover_text(
+                "Added to every reading of this series in this graph -- the correction for a sensor \
+                 that reads high or low.\nThe log itself is not changed, and the line says what was \
+                 added to it.",
+            )
+            .changed()
+        {
+            action = SeriesAction::Corrected;
+        }
+        if entry.value_offset != 0.0
+            && ui.small_button("⟲").on_hover_text("Back to what the log says").clicked()
+        {
+            entry.value_offset = 0.0;
+            action = SeriesAction::Corrected;
+        }
+    });
+    action
+}
+
+/// What a series says it is in, if the project still has it.
+fn series_unit(project: &Project, source: SourceId, series: &str) -> Option<String> {
+    let SourceKind::Log(log) = &project.source(source)?.kind else {
+        return None;
+    };
+    log.series.iter().find(|s| s.name == series)?.unit.clone()
+}
+
 /// A pane that cannot draw what it was asked to, in the theme's error colour
 /// -- a fixed red is illegible on a light background.
 fn error_label(ui: &mut egui::Ui, text: &str) {
@@ -900,10 +1035,14 @@ fn error_label(ui: &mut egui::Ui, text: &str) {
     ui.colored_label(color, text);
 }
 
-/// Legend labels repeat the message prefix on every line; the playhead
-/// readout is tighter with just the field.
-fn short_label(label: &str) -> &str {
-    label.rsplit('.').next().unwrap_or(label)
+/// `"PRESSURE_VESSEL[1].pressure1"` -> `"pressure1"`.
+///
+/// Legend labels repeat the message prefix on every line; the playhead readout
+/// is tighter with just the field. It is the *series name* that is trimmed and
+/// never the label built from it -- a label can carry a source's file name and
+/// a correction, and both have dots in them.
+fn field_of(series: &str) -> &str {
+    series.rsplit('.').next().unwrap_or(series)
 }
 
 impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
@@ -963,6 +1102,7 @@ mod tests {
                 series: n.to_string(),
                 color: Color32::WHITE,
                 axis: PlotAxis::Left,
+                value_offset: 0.0,
             })
             .collect()
     }
@@ -1074,6 +1214,93 @@ mod tests {
         assert!((height(left) - height(right)).abs() < 1e-9);
         assert!(height(left) > 0.5, "zero should sit high up, was at {}", height(left));
         assert!(left.0 <= -100.0 && left.1 >= -20.0, "{left:?}");
+    }
+
+    fn entry_with_offset(offset: f64) -> PlotEntry {
+        PlotEntry {
+            source: 0,
+            series: "PRESSURE_VESSEL[1].pressure1".to_string(),
+            color: Color32::WHITE,
+            axis: PlotAxis::Left,
+            value_offset: offset,
+        }
+    }
+
+    /// A sensor reading 10 bar low is corrected by moving the samples *and*
+    /// the range they are drawn in by the same amount -- one without the other
+    /// is a line that has left its own axis.
+    #[test]
+    fn a_calibration_offset_moves_the_samples_and_their_range_together() {
+        let entry = entry_with_offset(10.0);
+        let mut points = vec![[0.0, 30.0], [1.0, 35.0], [2.0, 31.0]];
+        entry.correct_points(&mut points);
+        assert_eq!(points, vec![[0.0, 40.0], [1.0, 45.0], [2.0, 41.0]]);
+        assert_eq!(entry.correct_bounds(Some((30.0, 35.0))), Some((40.0, 45.0)));
+        assert_eq!(entry.corrected(30.0), 40.0);
+        // Nothing to correct is nothing to do -- including no `None` turning
+        // into a range.
+        assert_eq!(entry_with_offset(0.0).correct_bounds(None), None);
+        let mut untouched = vec![[0.0, 30.0]];
+        entry_with_offset(0.0).correct_points(&mut untouched);
+        assert_eq!(untouched, vec![[0.0, 30.0]]);
+    }
+
+    /// The correction is not allowed to be invisible: the line says what was
+    /// added to it, in the legend, the readout and an exported figure alike.
+    #[test]
+    fn a_corrected_line_says_so_in_its_name() {
+        let entry = entry_with_offset(10.0);
+        assert_eq!(entry.label_with_offset("pressure1", Some("bar")), "pressure1 (+10 bar)");
+        assert_eq!(entry_with_offset(-2.5).label_with_offset("p", Some("bar")), "p (-2.5 bar)");
+        assert_eq!(entry_with_offset(0.25).label_with_offset("p", None), "p (+0.25)");
+        // ... and an uncorrected one is left exactly as it was.
+        assert_eq!(entry_with_offset(0.0).label_with_offset("p", Some("bar")), "p");
+    }
+
+    /// The readout is built from the series name, not from the label, so
+    /// neither a file name nor a correction can be mistaken for the field.
+    #[test]
+    fn the_readout_name_is_the_field_and_the_correction() {
+        assert_eq!(field_of("PRESSURE_VESSEL[1].pressure1"), "pressure1");
+        assert_eq!(field_of("tank_temp_3"), "tank_temp_3");
+        let entry = entry_with_offset(10.0);
+        let name = entry.label_with_offset(field_of("PRESSURE_VESSEL[1].pressure1"), Some("bar"));
+        assert_eq!(name, "pressure1 (+10 bar)");
+    }
+
+    #[test]
+    fn an_offset_reads_as_a_signed_number() {
+        assert_eq!(offset_tag(10.0, Some("bar")), "+10 bar");
+        assert_eq!(offset_tag(-0.125, Some("°C")), "-0.125 °C");
+        assert_eq!(offset_tag(3.0, None), "+3");
+        assert_eq!(offset_tag(3.0, Some("")), "+3");
+    }
+
+    /// The ⚙ menu's per-series row, laid out for real: it has to fit the menu
+    /// it lives in (260 px) and hand back what the user did.
+    #[test]
+    fn the_series_row_fits_the_settings_menu() {
+        const WIDTH: f32 = 260.0;
+        let ctx = egui::Context::default();
+        let mut entry = entry_with_offset(10.0);
+        let mut size = egui::Vec2::ZERO;
+        let mut action = SeriesAction::Drop;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            let rect = egui::Rect::from_min_size(ui.max_rect().min, egui::vec2(WIDTH, 400.0));
+            let scope = ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                action = series_settings(ui, &mut entry, Some("bar"));
+            });
+            size = scope.response.rect.size();
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(action, SeriesAction::None, "nothing was clicked");
+        assert_eq!(entry.value_offset, 10.0, "and nothing was changed");
+        assert!(size.x <= WIDTH + 1.0, "the row asked for {} px of a {WIDTH} px menu", size.x);
     }
 
     #[test]

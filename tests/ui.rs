@@ -654,3 +654,25 @@ fn the_export_window_survives_a_range_with_no_data_in_it() {
         dialog.show(ui.ctx(), &cx);
     });
 }
+
+/// A graph with a miscalibrated sensor corrected in it: the line, its axis and
+/// its name all move together, and the pane draws.
+#[test]
+fn a_graph_with_a_corrected_sensor_draws() {
+    let mut project = project_with_two_scales();
+    let source = project.sources[0].id;
+    let mut plots = Plots::default();
+    let id = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
+    plots.add(id, source, "THRUST.force".to_string(), PlotAxis::Right);
+    plots.get_mut(id).unwrap().entries[0].value_offset = 10.0;
+    plots.get_mut(id).unwrap().entries[1].value_offset = -250.0;
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    timeline.cursor = 12.0;
+
+    draw_pane(&mut project, &mut plots, &mut timeline, Pane::Plot(id));
+
+    // ... and normalized, where the correction cancels out of the shape but
+    // must not divide by anything different.
+    plots.get_mut(id).unwrap().normalize = true;
+    draw_pane(&mut project, &mut plots, &mut timeline, Pane::Plot(id));
+}
