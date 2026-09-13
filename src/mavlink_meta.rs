@@ -65,6 +65,8 @@ impl FieldMeta {
     pub fn unit_scale(&self) -> (Option<&'static str>, f64) {
         match self.units {
             Some("cdegC") => (Some("°C"), 0.01),
+            // Not a MAVLink unit: see `unit_override` in build.rs.
+            Some("ddegC") => (Some("°C"), 0.1),
             Some("cdeg") => (Some("deg"), 0.01),
             Some("cA") => (Some("A"), 0.01),
             Some("c%") => (Some("%"), 0.01),
@@ -160,5 +162,15 @@ mod tests {
         assert_eq!(bat.field("voltages").unwrap().invalid_value(), Some(65535.0));
         // `type` is renamed by the code generator; the schema must follow.
         assert!(bat.field("mavtype").is_some());
+    }
+
+    #[test]
+    fn barometer_temperature_is_in_tenths_of_a_degree() {
+        for name in ["SCALED_PRESSURE", "SCALED_PRESSURE2", "SCALED_PRESSURE3"] {
+            let msg = message(name).expect("SCALED_PRESSURE* from common.xml");
+            assert_eq!(msg.field("temperature").unwrap().unit_scale(), (Some("°C"), 0.1), "{name}");
+            // Only the field the sender gets wrong is overridden.
+            assert_eq!(msg.field("press_abs").unwrap().units, Some("hPa"), "{name}");
+        }
     }
 }

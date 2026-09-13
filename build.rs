@@ -103,6 +103,7 @@ impl Schema {
                             else {
                                 continue;
                             };
+                            let units = unit_override(msg, &name).map(str::to_string).or_else(|| attr("units"));
                             self.messages.entry(msg.clone()).or_default().push(Field {
                                 // `mavlink-bindgen` renames fields that collide
                                 // with Rust keywords, and that renamed form is
@@ -110,7 +111,7 @@ impl Schema {
                                 // JSON key hit.
                                 name: if name == "type" { "mavtype".to_string() } else { name },
                                 ty,
-                                units: attr("units"),
+                                units,
                                 enum_name: attr("enum"),
                                 invalid: attr("invalid"),
                                 is_instance: attr("instance").as_deref() == Some("true"),
@@ -174,6 +175,19 @@ impl Schema {
         }
         out.push_str("];\n");
         out
+    }
+}
+
+/// Fields whose sender doesn't send the unit the XML declares. `common.xml`
+/// is upstream's, so the correction lives here rather than in the file.
+///
+/// `SCALED_PRESSURE*.temperature` is declared `cdegC`, but our barometers
+/// send tenths of a degree: read as centidegrees, a board sitting next to
+/// ~20 °C vessel sensors reports 4.5 °C instead of 45 °C.
+fn unit_override(message: &str, field: &str) -> Option<&'static str> {
+    match (message, field) {
+        ("SCALED_PRESSURE" | "SCALED_PRESSURE2" | "SCALED_PRESSURE3", "temperature") => Some("ddegC"),
+        _ => None,
     }
 }
 
