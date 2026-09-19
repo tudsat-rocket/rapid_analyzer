@@ -55,6 +55,16 @@ impl Timeline {
         self.cursor = if let Some((lo, hi)) = bounds { t.clamp(lo, hi) } else { t };
     }
 
+    /// Moves the playhead somewhere that may be off screen -- a row picked in
+    /// a list -- and slides the window along to show it, keeping the zoom.
+    pub fn jump_to(&mut self, t: f64, bounds: Option<(f64, f64)>) {
+        self.seek(t, bounds);
+        if !(self.view_start..=self.view_end).contains(&self.cursor) {
+            let half = self.view_span() * 0.5;
+            self.set_view(self.cursor - half, self.cursor + half);
+        }
+    }
+
     pub fn step(&mut self, delta_seconds: f64, bounds: Option<(f64, f64)>) {
         let t = self.cursor + delta_seconds;
         self.seek(t, bounds);

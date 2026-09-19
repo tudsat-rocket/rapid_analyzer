@@ -14,10 +14,11 @@ use egui_tiles::{Behavior as _, TileId};
 
 use rapid_analyzer::can::{CanFrame, CanFrames, FieldKind, SignalSpec};
 use rapid_analyzer::can_builder::CanBuilder;
+use rapid_analyzer::canopen_inspector::{CanOpenInspector, InspectorAction, Tab};
 use rapid_analyzer::export::ExportItem;
 use rapid_analyzer::export::dialog::{DialogContext, ExportDialog};
 use rapid_analyzer::model::{LogFormat, LogSource, Project, Source, SourceKind};
-use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior};
+use rapid_analyzer::panes::{Pane, PlotAxis, Plots, TreeBehavior, form_menu};
 use rapid_analyzer::series::TimeSeries;
 use rapid_analyzer::tank::{TANK_SENSORS, Tanks};
 use rapid_analyzer::timeline::Timeline;
@@ -675,4 +676,187 @@ fn a_graph_with_a_corrected_sensor_draws() {
     // must not divide by anything different.
     plots.get_mut(id).unwrap().normalize = true;
     draw_pane(&mut project, &mut plots, &mut timeline, Pane::Plot(id));
+}
+
+/// One frame with these input events.
+fn frame_with(ctx: &egui::Context, events: Vec<egui::Event>, contents: impl FnMut(&mut egui::Ui)) {
+    let raw = RawInput {
+        events,
+        ..input()
+    };
+    ctx.run_ui(raw, contents).drop_without_applying_deltas();
+}
+
+fn press(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// What a form menu under test holds, and where its widgets were drawn.
+#[derive(Default)]
+struct FormMenu {
+    text: String,
+    offset: f64,
+    button: Option<egui::Rect>,
+    field: Option<egui::Rect>,
+    drag: Option<egui::Rect>,
+}
+
+impl FormMenu {
+    fn run(&mut self, ctx: &egui::Context, events: Vec<egui::Event>) {
+        frame_with(ctx, events, |ui| {
+            let (response, inner) = form_menu(ui, "⚙", |ui| {
+                let field = ui.text_edit_singleline(&mut self.text).rect;
+                let drag = ui.add(egui::DragValue::new(&mut self.offset)).rect;
+                (field, drag)
+            });
+            self.button = Some(response.rect);
+            self.field = inner.as_ref().map(|i| i.inner.0);
+            self.drag = inner.map(|i| i.inner.1);
+        });
+    }
+
+    /// Press, release, and a frame for the result to show.
+    fn click(&mut self, ctx: &egui::Context, pos: egui::Pos2) {
+        self.run(ctx, vec![egui::Event::PointerMoved(pos), press(pos, true)]);
+        self.run(ctx, vec![press(pos, false)]);
+        self.run(ctx, vec![]);
+    }
+}
+
+fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers,
+    }
+}
+
+/// The bug this guards against: a plot's ⚙ menu closed on the click that
+/// focused its title field, so the title could be seen but never typed into
+/// -- and the offset could only be dragged, never typed. A form menu has to
+/// survive a click inside it and take the keystrokes that follow.
+#[test]
+fn a_form_menu_stays_open_to_be_typed_into() {
+    let ctx = egui::Context::default();
+    let mut menu = FormMenu::default();
+
+    menu.run(&ctx, vec![]);
+    assert!(menu.field.is_none(), "closed until clicked");
+    menu.click(&ctx, menu.button.expect("drawn").center());
+    let field = menu.field.expect("the menu opened");
+
+    // Click into the text field: the menu must still be there afterwards.
+    menu.click(&ctx, field.center());
+    assert!(menu.field.is_some(), "clicking the text field closed the menu");
+    menu.run(&ctx, vec![egui::Event::Text("Tank pressures".into())]);
+    assert_eq!(menu.text, "Tank pressures");
+
+    // ... and into the number: a click turns it into a text box to type in.
+    menu.click(&ctx, menu.drag.expect("still open").center());
+    assert!(menu.drag.is_some(), "clicking the offset closed the menu");
+    menu.run(
+        &ctx,
+        vec![key(egui::Key::A, egui::Modifiers::COMMAND), egui::Event::Text("-12.5".into())],
+    );
+    menu.run(&ctx, vec![key(egui::Key::Enter, egui::Modifiers::NONE)]);
+    menu.run(&ctx, vec![]);
+    assert_eq!(menu.offset, -12.5);
+
+    // A click outside still closes it.
+    menu.click(&ctx, egui::pos2(1300.0, 850.0));
+    assert!(menu.field.is_none(), "a click outside closes it");
+}
+
+/// IO board traffic of every shape the inspector shows: TPDOs, heartbeats
+/// with a dropout, an SDO write acknowledged, and one refused.
+fn project_with_io_boards() -> Project {
+    let mut frames = CanFrames::default();
+    let mut push = |t: f64, id: u32, len: u8, data: [u8; 8]| {
+        frames.push(CanFrame {
+            t_utc: t,
+            id,
+            bus: 1,
+            len,
+            data,
+        })
+    };
+    for i in 0..100 {
+        let t = i as f64 * 0.5;
+        push(t, 0x225, 8, [0xF4, 0x01, 0xE8, 0x83, 0, 0, 0, 0]);
+        push(t, 0x305, 8, [0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00]);
+        if !(20..30).contains(&i) {
+            push(t, 0x705, 1, [0x05, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        push(t + 0.01, 0x605, 8, [0x2B, 0x10, 0x20, 0x01, (i * 10) as u8, 0, 0, 0]);
+        push(t + 0.012, 0x585, 8, [0x60, 0x10, 0x20, 0x01, 0, 0, 0, 0]);
+    }
+    push(10.0, 0x605, 8, [0x2F, 0x20, 0x20, 0x01, 0x01, 0, 0, 0]);
+    push(10.001, 0x585, 8, [0x80, 0x20, 0x20, 0x01, 0x21, 0x00, 0x00, 0x08]);
+
+    let mut project = Project::new();
+    let id = project.alloc_id();
+    project.sources.push(Source {
+        id,
+        name: "boards.tlog".to_string(),
+        path: "boards.tlog".into(),
+        offset_seconds: 0.0,
+        color: egui::Color32::WHITE,
+        enabled: true,
+        kind: SourceKind::Log(LogSource {
+            series: rapid_analyzer::can::iocan::decode(frames.frames()),
+            format: LogFormat::Tlog,
+            can: frames,
+        }),
+    });
+    project
+}
+
+#[test]
+fn the_canopen_inspector_draws_every_tab() {
+    let project = project_with_io_boards();
+    let source = &project.sources[0];
+    let SourceKind::Log(log) = &source.kind else {
+        panic!("log source");
+    };
+    let mut inspector = CanOpenInspector::new(source.id, &log.can);
+    let summary = inspector.log();
+    assert_eq!(summary.nodes.len(), 1);
+    assert_eq!(summary.transfers.len(), 202);
+    // The heartbeat dropout between 10 s and 15 s.
+    assert!(summary.nodes[0].longest_heartbeat_gap.unwrap().0 > 5.0);
+
+    let ctx = egui::Context::default();
+    for tab in [Tab::Nodes, Tab::Dictionary, Tab::Sdo] {
+        inspector.open_tab(tab);
+        for every in [false, true] {
+            inspector.show_every_object(every);
+            // At the start, in the middle, and before the log begins.
+            for cursor in [0.0, 25.0, -100.0] {
+                draw_on(&ctx, |ui| {
+                    let action = inspector.contents(ui, source, cursor);
+                    assert!(matches!(action, InspectorAction::None));
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn the_canopen_inspector_copes_with_a_log_without_io_boards() {
+    let project = project_with_two_scales();
+    let source = &project.sources[0];
+    let mut inspector = CanOpenInspector::new(source.id, &CanFrames::default());
+    for tab in [Tab::Nodes, Tab::Dictionary, Tab::Sdo] {
+        inspector.open_tab(tab);
+        draw(|ui| {
+            inspector.contents(ui, source, 0.0);
+        });
+    }
 }

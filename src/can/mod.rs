@@ -13,7 +13,12 @@
 //!   rails -- with nothing for the user to specify.
 //! * [`SignalSpec`] is the fallback for every other bus on the vehicle: name
 //!   an identifier, a byte offset and a type, and get a series out.
+//!
+//! [`canopen`] reads the same frames a third way, as the IO boards' object
+//! dictionary over time -- SDO reads, writes and aborts, and the dictionary
+//! objects each TPDO mirrors -- for the inspector window.
 
+pub mod canopen;
 pub mod iocan;
 
 use crate::series::TimeSeries;

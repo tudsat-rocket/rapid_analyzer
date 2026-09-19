@@ -967,7 +967,9 @@ pub(crate) fn series_picker(
 
     // Scoring every series in the project means walking a few hundred names,
     // so it happens when the menu is open and not on every frame behind it.
-    ui.push_id(id, |ui| ui.menu_button(label, |ui| {
+    // A form menu, since the filter box has to take a click without the
+    // menu closing under it.
+    ui.push_id(id, |ui| crate::panes::form_menu(ui, label, |ui| {
         let mut candidates: Vec<(u8, SourceId, &TimeSeries, &str)> = Vec::new();
         for source in &project.sources {
             let SourceKind::Log(log) = &source.kind else {
@@ -1022,7 +1024,7 @@ pub(crate) fn series_picker(
         });
     }))
     .inner
-    .response
+    .0
     .on_hover_text(hover);
 }
 

@@ -27,6 +27,26 @@ pub enum Pane {
 const CURSOR_COLOR: Color32 = Color32::from_rgb(0xFF, 0x5C, 0x3D);
 const TARGET_PLOT_POINTS: usize = 2000;
 
+/// A drop-down menu that stays open while the user works inside it.
+///
+/// `ui.menu_button` closes on *any* click, including the one that focuses a
+/// text field or turns a `DragValue` into a text box -- so a menu holding
+/// either could be looked at but not typed into. This one closes on a click
+/// outside it (or an explicit `ui.close()`), which is what a menu that is
+/// really a small form needs.
+pub fn form_menu<'a, R>(
+    ui: &mut egui::Ui,
+    label: impl egui::IntoAtoms<'a>,
+    content: impl FnOnce(&mut egui::Ui) -> R,
+) -> (egui::Response, Option<egui::InnerResponse<R>>) {
+    egui::containers::menu::MenuButton::new(label)
+        .config(
+            egui::containers::menu::MenuConfig::new()
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+        )
+        .ui(ui, content)
+}
+
 /// `None` means we already tried to open an audio device for this source and
 /// failed (e.g. headless machine, no sound card) -- don't retry every frame.
 pub type AudioPlayerSlot = Option<AudioPlayback>;
@@ -538,7 +558,7 @@ impl<'a> TreeBehavior<'a> {
         ui.horizontal(|ui| {
             ui.strong(&title);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.menu_button("⚙", |ui| {
+                form_menu(ui, "⚙", |ui| {
                     ui.set_min_width(260.0);
                     ui.label("Title");
                     let hint = auto_title(&plot.entries);
@@ -995,7 +1015,10 @@ fn series_settings(ui: &mut egui::Ui, entry: &mut PlotEntry, unit: Option<&str>)
     ui.horizontal(|ui| {
         ui.add_space(16.0);
         ui.weak("offset");
-        let mut drag = egui::DragValue::new(&mut entry.value_offset).speed(0.05).max_decimals(4);
+        let mut drag = egui::DragValue::new(&mut entry.value_offset)
+            .speed(0.05)
+            .max_decimals(4)
+            .min_decimals(1);
         if let Some(unit) = unit.filter(|u| !u.is_empty()) {
             drag = drag.suffix(format!(" {unit}"));
         }
@@ -1003,7 +1026,7 @@ fn series_settings(ui: &mut egui::Ui, entry: &mut PlotEntry, unit: Option<&str>)
             .add(drag)
             .on_hover_text(
                 "Added to every reading of this series in this graph -- the correction for a sensor \
-                 that reads high or low.\nThe log itself is not changed, and the line says what was \
+                 that reads high or low. Click to type a number, or drag.\nThe log itself is not changed, and the line says what was \
                  added to it.",
             )
             .changed()

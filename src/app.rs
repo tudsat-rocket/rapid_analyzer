@@ -6,6 +6,7 @@ use std::time::Instant;
 use egui_tiles::{Tile, TileId};
 
 use crate::can_builder::{BuilderAction, CanBuilder};
+use crate::canopen_inspector::{CanOpenInspector, InspectorAction};
 use crate::colors::color_for_index;
 use crate::export::ExportItem;
 use crate::export::dialog::{DialogContext, ExportDialog};
@@ -32,6 +33,7 @@ enum PendingAction {
     HideSeries(SourceId, String),
     RemoveSource(SourceId),
     OpenCanBuilder(SourceId),
+    OpenCanOpen(SourceId),
     NewVaporPane,
     NewTankPane,
 }
@@ -56,6 +58,9 @@ pub struct App {
     /// The CAN signal picker, while it is open. At most one at a time -- it
     /// is a modal-ish tool, not a per-source panel.
     can_builder: Option<CanBuilder>,
+    /// The CANopen inspector, while it is open. One at a time, like the
+    /// signal picker; opening it for another log replaces it.
+    canopen: Option<CanOpenInspector>,
     /// The figure exporter's window. It keeps its settings between openings,
     /// so a report's second figure is one click away from its first.
     export: ExportDialog,
@@ -85,6 +90,7 @@ impl App {
             last_update: Instant::now(),
             ffmpeg_available: import::video::ffmpeg_available(),
             can_builder: None,
+            canopen: None,
             export: ExportDialog::default(),
             theme: egui::ThemePreference::System,
         };
@@ -225,6 +231,11 @@ impl App {
                     self.can_builder = Some(CanBuilder::new(source, &log.can));
                 }
             }
+            PendingAction::OpenCanOpen(source) => {
+                if let Some(SourceKind::Log(log)) = self.project.source(source).map(|s| &s.kind) {
+                    self.canopen = Some(CanOpenInspector::new(source, &log.can));
+                }
+            }
         }
     }
 
@@ -299,6 +310,35 @@ impl App {
                 self.can_builder = Some(builder);
             }
         }
+    }
+
+    /// The CANopen inspector. Like the signal picker, what it hands back is a
+    /// series -- one dictionary object's history -- or a place to put the
+    /// playhead.
+    fn canopen_inspector(&mut self, ctx: &egui::Context) {
+        let Some(mut inspector) = self.canopen.take() else {
+            return;
+        };
+        let source_id = inspector.source();
+        let Some(source) = self.project.source(source_id) else {
+            return;
+        };
+        match inspector.show(ctx, source, self.timeline.cursor) {
+            InspectorAction::None => {}
+            InspectorAction::Close => return,
+            InspectorAction::Seek(t) => {
+                let bounds = self.project.time_bounds();
+                self.timeline.jump_to(t, bounds);
+            }
+            InspectorAction::Plot(series) => {
+                let name = series.name.clone();
+                self.add_series(source_id, series);
+                let id = self.plots.create(source_id, name.clone());
+                self.add_pane(Pane::Plot(id));
+                self.status = Some(format!("Added {name}"));
+            }
+        }
+        self.canopen = Some(inspector);
     }
 
     /// Adds (or replaces) a series on a log source, keeping the list sorted
@@ -488,6 +528,16 @@ impl App {
                                     .clicked()
                                 {
                                     pending.push(PendingAction::OpenCanBuilder(source.id));
+                                }
+                                if ui
+                                    .small_button("CANopen…")
+                                    .on_hover_text(
+                                        "Inspect the IO boards: nodes and heartbeats, SDO reads, writes and \
+                                         aborts, and every object dictionary value at the playhead",
+                                    )
+                                    .clicked()
+                                {
+                                    pending.push(PendingAction::OpenCanOpen(source.id));
                                 }
                             });
                         }
@@ -825,6 +875,7 @@ impl eframe::App for App {
         });
 
         self.can_signal_builder(&ctx);
+        self.canopen_inspector(&ctx);
         self.export_window(&ctx);
 
         let mut closed = Vec::new();

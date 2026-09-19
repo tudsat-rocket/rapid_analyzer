@@ -27,11 +27,17 @@ zoomed together.
   state and per-node heartbeats -- see "CAN decoding" below. Anything else on
   the bus can be plotted by hand: "＋ signal…" next to a log's frame count
   opens a picker for an identifier, a byte offset, a type and a scale.
+- **CANopen inspector**: "CANopen…" next to the same frame count opens the IO
+  boards as CANopen nodes -- which were on the bus and whether their
+  heartbeat ever dropped out, every SDO read, write and abort (with its
+  reason) the master exchanged with them, and each node's object dictionary
+  as it stood at the playhead. See "CAN decoding" below.
 - **Multi-series graphs**: any number of series share one graph, so a tank's
   pressure and temperature can be read against each other. Tick a series to
   open it in its own graph, or use ➕ next to it to add it to an existing
-  one; each graph has a title (auto-generated from its contents, editable)
-  and an optional 0..1 normalization for series whose scales differ.
+  one; each graph has a title (auto-generated from its contents; type your
+  own into the ⚙ menu's title field) and an optional 0..1 normalization for
+  series whose scales differ.
 - **Two value axes**: a series whose scale would flatten the others -- a
   thrust curve in newtons next to a pressure in bar -- can be drawn against
   the graph's right-hand axis instead, with its own numbers and unit. Add it
@@ -379,8 +385,8 @@ frames are pulled out of the generic path and handled by `src/can/`:
   | `CAN_ADC[n]` | raw amplifier readings per I2C bus and channel |
   | `CAN_RAIL[n]` | logic / HCO1+2 / HCO3+4 rail voltage (mV) and current (mA) |
   | `CAN_STATUS[n]` | master link state, raw debug flag, stalled-valve mask, ms since the last master heartbeat |
-  | `CAN_I2C[n]` | amplifier presence bitmaps and the sweep counter |
-  | `CAN_NODE[n]` | the node's own heartbeat -- constant in value, so what it shows is exactly when a node went quiet |
+  | `CAN_I2C[n]` | amplifier presence bitmaps, how many amplifiers answered per bus (`present_count_bus0/1`), and the sweep counter |
+  | `CAN_NODE[n]` | the node's own heartbeat (`nmt_state`), and the time between two of them (`heartbeat_interval`, ms) -- flat at the configured period, with a spike wherever the node went quiet |
 
   `[n]` is the node id (`[bus2:5]` if a log carries more than one bus).
   Slots and channels a node never read are left out rather than drawn as a
@@ -395,8 +401,35 @@ frames are pulled out of the generic path and handled by `src/can/`:
   joins that source's series list like any other. Re-adding under the same
   name replaces it, so a scale factor can be refined against an open graph.
 
+- `src/can/canopen.rs` reads the same frames as what they are to CANopen: the
+  boards keep their state and configuration in an object dictionary
+  (`index.sub`, mirrored from the firmware's `device-conf/can-io.toml`),
+  accessed by expedited SDO (`0x600 + node` requests, `0x580 + node`
+  responses), and most TPDOs are copies of dictionary objects. The
+  **CANopen…** window has three tabs:
+
+  - **Nodes** -- every board that sent anything: NMT state and heartbeat
+    period, the longest heartbeat gap (flagged, and clickable, when it is a
+    real dropout), the node's master link state and raw debug flag at the
+    playhead, TPDO frame counts, and SDO traffic including aborts.
+  - **Object dictionary** -- per node, each object's value at the playhead,
+    formatted as the firmware documents it (valve position words with their
+    "released" flag, status codes by name, sensor counts converted by the
+    slot's declared unit), when it last changed, and whether that came from a
+    TPDO, an SDO read or an SDO write. Tick off "only objects in the log" to
+    see the whole dictionary. 📈 plots any object's history as a
+    `CAN_OD[n].…` series, drawn as steps.
+  - **SDO log** -- every transfer, filterable by node, text and "aborts
+    only", with the abort reason spelled out (CiA 301 codes) and, when the
+    log holds the request too, the node's response latency. Click a time to
+    move the playhead there; "to playhead" scrolls to the current one.
+
+  A flight computer's log usually holds the nodes' *answers* but not its own
+  requests, so a write shows as acknowledged without the value written; the
+  inspector says so, and takes values from SDO reads and TPDOs instead.
+
 Since this mirrors a protocol defined elsewhere, a change to the firmware's
-`iocan-proto` has to be made here too; `src/can/iocan.rs`'s tests pin the
+`iocan-proto` or `device-conf/can-io.toml` has to be made here too; `src/can/iocan.rs`'s tests pin the
 identifier layout and each frame's field offsets against known-good frames
 from a real log.
 

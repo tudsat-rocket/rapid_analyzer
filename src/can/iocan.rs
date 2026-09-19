@@ -17,23 +17,24 @@
 //! table below is written out in full and cross-checked by
 //! [`tests::the_kind_table_matches_the_identifier_layout`] rather than derived.
 //!
-//! Deliberately *not* decoded: SDO traffic (a request/response protocol, not
-//! samples of anything) and any identifier outside the layout above -- those
-//! are what [`super::SignalSpec`] is for.
+//! Deliberately *not* decoded here: SDO traffic (a request/response protocol,
+//! not samples of anything -- [`super::canopen`] reads it as the dictionary
+//! accesses it is) and any identifier outside the layout above, which is what
+//! [`super::SignalSpec`] is for.
 
 use std::collections::HashMap;
 
 use super::CanFrame;
 use crate::series::TimeSeries;
 
-const PDO_BASE: u32 = 0x200;
-const SDO_RESPONSE_BASE: u32 = 0x580;
-const SDO_REQUEST_BASE: u32 = 0x600;
-const HEARTBEAT_BASE: u32 = 0x700;
-const NODE_ID_MASK: u32 = 0x00F;
+pub(super) const PDO_BASE: u32 = 0x200;
+pub(super) const SDO_RESPONSE_BASE: u32 = 0x580;
+pub(super) const SDO_REQUEST_BASE: u32 = 0x600;
+pub(super) const HEARTBEAT_BASE: u32 = 0x700;
+pub(super) const NODE_ID_MASK: u32 = 0x00F;
 
 /// Number of sensor slots the protocol can carry, across `Sensor0`/`1`/`3`.
-const PROTOCOL_SENSOR_SLOTS: usize = 12;
+pub(super) const PROTOCOL_SENSOR_SLOTS: usize = 12;
 
 /// "No reading" for a calibrated sensor slot, and for a raw amplifier channel.
 const SENSOR_INVALID: i16 = i16::MIN;
@@ -41,8 +42,8 @@ const RAW_INVALID: u16 = u16::MAX;
 
 /// A high current output's pulse width word: these two values are sentinels
 /// rather than widths, since every real width is far below `0x8000`.
-const HCO_DIGITAL_ON: u16 = 0x8000;
-const HCO_DIGITAL_OFF: u16 = 0x0000;
+pub(super) const HCO_DIGITAL_ON: u16 = 0x8000;
+pub(super) const HCO_DIGITAL_OFF: u16 = 0x0000;
 
 /// Bit 15 of a valve position word: the drive is released. The rest is the
 /// position in promille.
@@ -73,7 +74,7 @@ pub enum TpdoKind {
     ValveCurrent,
 }
 
-const KINDS: [TpdoKind; 18] = [
+pub const KINDS: [TpdoKind; 18] = [
     TpdoKind::ValveCommanded,
     TpdoKind::ValveTarget,
     TpdoKind::ValveMeasured,
@@ -99,7 +100,7 @@ impl TpdoKind {
         KINDS.get(index as usize).copied()
     }
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::ValveCommanded => "ValveCommanded",
             Self::ValveTarget => "ValveTarget",
@@ -218,6 +219,8 @@ struct Collector {
     /// units mid-log would be misread, which is not a thing that happens
     /// outside of a calibration session.
     sensor_units: HashMap<(u8, u8), [u8; PROTOCOL_SENSOR_SLOTS]>,
+    /// Each node's previous heartbeat, for the interval series.
+    last_heartbeat: HashMap<(u8, u8), f64>,
     multi_bus: bool,
 }
 
@@ -241,6 +244,7 @@ impl Collector {
         Self {
             series: HashMap::new(),
             sensor_units,
+            last_heartbeat: HashMap::new(),
             multi_bus: buses.len() > 1,
         }
     }
@@ -308,6 +312,14 @@ impl Collector {
             if frame.len >= 1 {
                 self.push(frame, NODE, "nmt_state", "", frame.data[0] as f64);
             }
+            // The same fact, readable at a glance: a flat line at the
+            // configured period (0x1017) with a spike wherever the node went
+            // quiet, however briefly -- a dropout far too short to see as a
+            // gap in `nmt_state` on a fifteen-minute window.
+            let node = (frame.bus, frame.id as u8 & NODE_ID_MASK as u8);
+            if let Some(previous) = self.last_heartbeat.insert(node, frame.t_utc) {
+                self.push(frame, NODE, "heartbeat_interval", "ms", (frame.t_utc - previous) * 1000.0);
+            }
             return;
         }
         let Some((_, kind)) = process_data(frame.id) else {
@@ -364,6 +376,11 @@ impl Collector {
                 self.push(frame, I2C, "present_bus0", "", words[0] as f64);
                 self.push(frame, I2C, "present_bus1", "", words[1] as f64);
                 self.push(frame, I2C, "sweeps", "", words[2] as f64);
+                // The bitmaps say *which* amplifiers answered; how many is
+                // the question a plot answers -- one dropping out mid-run is
+                // a step down.
+                self.push(frame, I2C, "present_count_bus0", "", words[0].count_ones() as f64);
+                self.push(frame, I2C, "present_count_bus1", "", words[1].count_ones() as f64);
             }
             TpdoKind::RailVoltage => {
                 for (i, mv) in u16x4(&frame.data).into_iter().take(3).enumerate() {
@@ -408,7 +425,7 @@ impl Collector {
 }
 
 /// Splits a process-data identifier into its node and kind.
-fn process_data(id: u32) -> Option<(u8, TpdoKind)> {
+pub(super) fn process_data(id: u32) -> Option<(u8, TpdoKind)> {
     if !(PDO_BASE..SDO_RESPONSE_BASE).contains(&id) {
         return None;
     }
@@ -419,7 +436,7 @@ fn process_data(id: u32) -> Option<(u8, TpdoKind)> {
 /// Display unit and the factor raw counts are multiplied by to reach it, for
 /// a sensor slot's declared unit code. An unknown or unseen code is left as
 /// raw counts rather than guessed at.
-fn sensor_unit(code: Option<u8>) -> (&'static str, f64) {
+pub(super) fn sensor_unit(code: Option<u8>) -> (&'static str, f64) {
     match code {
         Some(0) => ("bar", 0.01),
         Some(1) => ("bar", 0.1),
@@ -428,7 +445,7 @@ fn sensor_unit(code: Option<u8>) -> (&'static str, f64) {
     }
 }
 
-fn u16x4(data: &[u8; 8]) -> [u16; 4] {
+pub(super) fn u16x4(data: &[u8; 8]) -> [u16; 4] {
     let mut out = [0u16; 4];
     for (slot, chunk) in out.iter_mut().zip(data.chunks_exact(2)) {
         *slot = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -436,17 +453,17 @@ fn u16x4(data: &[u8; 8]) -> [u16; 4] {
     out
 }
 
-fn i16x4(data: &[u8; 8]) -> [i16; 4] {
+pub(super) fn i16x4(data: &[u8; 8]) -> [i16; 4] {
     u16x4(data).map(|v| v as i16)
 }
 
 /// Four 4-bit values packed low nibble first into two bytes.
-fn unpack_nibbles(bytes: &[u8]) -> [u8; 4] {
+pub(super) fn unpack_nibbles(bytes: &[u8]) -> [u8; 4] {
     [bytes[0] & 0xF, bytes[0] >> 4, bytes[1] & 0xF, bytes[1] >> 4]
 }
 
 /// Twelve 2-bit values packed low bits first into three bytes.
-fn unpack_2bit(bytes: &[u8]) -> [u8; PROTOCOL_SENSOR_SLOTS] {
+pub(super) fn unpack_2bit(bytes: &[u8]) -> [u8; PROTOCOL_SENSOR_SLOTS] {
     let mut out = [0u8; PROTOCOL_SENSOR_SLOTS];
     for (i, slot) in out.iter_mut().enumerate() {
         *slot = (bytes[i / 4] >> ((i % 4) * 2)) & 0b11;
@@ -621,8 +638,39 @@ mod tests {
         assert_eq!(value(&frames, "CAN_STATUS[5].link_state"), Some(4.0));
         assert_eq!(value(&frames, "CAN_STATUS[5].ms_since_heartbeat"), Some(0x01F7_4F19 as f64));
         assert_eq!(value(&frames, "CAN_NODE[5].nmt_state"), Some(5.0));
+        // One heartbeat is no interval yet.
+        assert!(!names(&frames).contains(&"CAN_NODE[5].heartbeat_interval".to_string()));
         // The fourth word of a rail frame is padding, not a fourth rail.
         assert_eq!(names(&frames).iter().filter(|n| n.starts_with("CAN_RAIL")).count(), 3);
+    }
+
+    #[test]
+    fn heartbeat_intervals_show_a_dropout() {
+        let frames: Vec<CanFrame> = [0.0, 0.5, 1.0, 3.0]
+            .into_iter()
+            .map(|t| {
+                let mut f = frame(0x705, [0x05, 0, 0, 0, 0, 0, 0, 0]);
+                f.t_utc = t;
+                f.len = 1;
+                f
+            })
+            .collect();
+        let series = decode(&frames)
+            .into_iter()
+            .find(|s| s.name == "CAN_NODE[5].heartbeat_interval")
+            .unwrap();
+        assert_eq!(series.unit.as_deref(), Some("ms"));
+        assert_eq!(series.value_at(0.5, 0.0), Some(500.0));
+        assert_eq!(series.value_at(3.0, 0.0), Some(2000.0));
+    }
+
+    #[test]
+    fn the_i2c_scan_counts_the_amplifiers_that_answered() {
+        // A real node 5 frame: amps 0..2 on bus 0, 0..1 on bus 1.
+        let frames = [frame(0x2D5, [0x07, 0x00, 0x03, 0x00, 0x45, 0x0E, 0x00, 0x00])];
+        assert_eq!(value(&frames, "CAN_I2C[5].present_count_bus0"), Some(3.0));
+        assert_eq!(value(&frames, "CAN_I2C[5].present_count_bus1"), Some(2.0));
+        assert_eq!(value(&frames, "CAN_I2C[5].sweeps"), Some(3653.0));
     }
 
     #[test]

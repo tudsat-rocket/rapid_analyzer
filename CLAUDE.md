@@ -211,6 +211,16 @@ would fold every node's traffic into one `CAN_FRAME.data[0]` series. `import/tlo
   so an inserted variant silently relabels everything after it; the tests pin it, along with each
   frame's field offsets, against real frames. Note `device-conf/can-io.toml`'s comment table in
   that repo is stale — `iocan-proto/src/ids.rs` is the authority.
+- `can/canopen.rs` reads the same frames as the IO boards' **object dictionary**
+  over time, for the inspector window (`canopen_inspector.rs`). `DICTIONARY`
+  mirrors `device-conf/can-io.toml` (plus the `0x1000` objects `src/store.rs`
+  generates) and must stay sorted by index -- `object()` bisects it. Values come
+  from SDO read responses, *acknowledged* SDO writes (the value is in the
+  request; an abort means it never landed), and `tpdo_objects`, which maps each
+  TPDO kind back to the objects it copies. Only changes are stored per object,
+  which is what keeps a 15-minute log's TPDO traffic to a few thousand entries.
+  The example tlog has only SDO *responses* (write acks) -- the logger never
+  sees its own requests -- so there the TPDO mirrors are the only values.
 - `can/mod.rs`'s `SignalSpec` + `can_builder.rs` are the manual path for every other device on
   the bus: identifier, byte offset, type, byte order, `raw × scale + offset`. The resulting
   `TimeSeries` is appended to the source's `series` (kept sorted, since the sidebar groups by
@@ -239,8 +249,8 @@ drifts >0.3 s from the timeline cursor; a missing output device is cached as `No
 
 ### UI panes
 
-The export window (`export::dialog`) and the CAN picker are `egui::Window`s
-rather than panes: both are a detour from reviewing a run, and the graphs
+The export window (`export::dialog`), the CAN picker and the CANopen inspector
+are `egui::Window`s rather than panes: all three are a detour from reviewing a run, and the graphs
 behind them stay usable.
 
 `egui_tiles` drives a rearrangeable tile tree of `Pane`s (`src/panes.rs`: `Plot(PlotId)`,
@@ -280,6 +290,12 @@ for and persists it, so one long file name would take half the window for the re
 session. Everything in it truncates (`wrap_mode` on the scroll area's `Ui`), and the source name
 wraps into whatever the trailing controls leave it. `app.rs`'s test lays out a header row in a
 320 px `Ui` and checks it stayed inside.
+
+A menu that holds a text field or a `DragValue` must be a `panes::form_menu`,
+not `ui.menu_button`: egui 0.36's menus close on *any* click inside them, so
+the click that focuses the field (or turns a `DragValue` into a text box)
+closes the menu under it. The plot ⚙ menu and the phase pane's series picker
+use it; `tests/ui.rs` clicks into one and types to pin it.
 
 **Zoom** is deliberately one-dimensional by default: `allow_zoom`/`allow_drag` are x-only, so the
 value axis stays fitted to what is visible. egui_plot's boxed zoom is the exception — it is the
