@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Instant;
 
 use egui_tiles::{Tile, TileId};
+use web_time::Instant;
 
 use crate::can_builder::{BuilderAction, CanBuilder};
 use crate::canopen_inspector::{CanOpenInspector, InspectorAction};
@@ -51,9 +51,22 @@ pub struct App {
     import_tx: Sender<ImportOutcome>,
     import_rx: Receiver<ImportOutcome>,
     importing: usize,
+    /// Files the browser has read -- picked or dropped -- waiting to be
+    /// parsed. They are parsed on the UI thread (there is no other), one
+    /// frame after they arrive, so the spinner is already on screen while it
+    /// happens.
+    #[cfg(target_arch = "wasm32")]
+    queued: Vec<(String, Vec<u8>)>,
+    /// Files as the browser finishes reading them. Reading is asynchronous,
+    /// so they come back over a channel, like a native import.
+    #[cfg(target_arch = "wasm32")]
+    picked_tx: Sender<(String, Result<Vec<u8>, String>)>,
+    #[cfg(target_arch = "wasm32")]
+    picked_rx: Receiver<(String, Result<Vec<u8>, String>)>,
     status: Option<String>,
     series_filter: String,
     last_update: Instant,
+    #[cfg(feature = "media")]
     ffmpeg_available: bool,
     /// The CAN signal picker, while it is open. At most one at a time -- it
     /// is a modal-ish tool, not a per-source panel.
@@ -72,6 +85,8 @@ pub struct App {
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_files: Vec<PathBuf>) -> Self {
         let (import_tx, import_rx) = channel();
+        #[cfg(target_arch = "wasm32")]
+        let (picked_tx, picked_rx) = channel();
         let mut app = Self {
             project: Project::new(),
             plots: Plots::default(),
@@ -85,9 +100,16 @@ impl App {
             import_tx,
             import_rx,
             importing: 0,
+            #[cfg(target_arch = "wasm32")]
+            queued: Vec::new(),
+            #[cfg(target_arch = "wasm32")]
+            picked_tx,
+            #[cfg(target_arch = "wasm32")]
+            picked_rx,
             status: None,
             series_filter: String::new(),
             last_update: Instant::now(),
+            #[cfg(feature = "media")]
             ffmpeg_available: import::video::ffmpeg_available(),
             can_builder: None,
             canopen: None,
@@ -103,13 +125,88 @@ impl App {
     fn start_import(&mut self, path: PathBuf) {
         self.importing += 1;
         let tx = self.import_tx.clone();
-        std::thread::spawn(move || {
+        let import = move || {
             let result = import::import_path(&path).map_err(|e| format!("{e:#}"));
             let _ = tx.send(ImportOutcome { path, result });
+        };
+        // There is no file system to read a path from in the browser either,
+        // so this only fails there -- but it fails with a message rather
+        // than the panic `thread::spawn` would be.
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::spawn(import);
+        #[cfg(target_arch = "wasm32")]
+        import();
+    }
+
+    /// Imports a file that arrived as its contents rather than a path.
+    #[cfg(target_arch = "wasm32")]
+    fn queue_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        self.importing += 1;
+        self.status = Some(format!("Reading {name}…"));
+        self.queued.push((name, bytes));
+    }
+
+    /// The desktop's file dialog: blocks, then imports in the background.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pick_file(&mut self, _ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new().pick_file() {
+            self.start_import(path);
+        }
+    }
+
+    /// The browser's file picker, which only ever answers asynchronously --
+    /// and may not answer at all if it is cancelled, which is why nothing
+    /// counts as importing until a file has actually been read.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_file(&mut self, ctx: &egui::Context) {
+        let tx = self.picked_tx.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Some(file) = rfd::AsyncFileDialog::new().pick_file().await {
+                let bytes = file.read().await;
+                let _ = tx.send((file.file_name(), Ok(bytes)));
+                ctx.request_repaint();
+            }
         });
     }
 
+    /// Files dropped onto the window. On the desktop they are paths; in the
+    /// browser, a handle whose contents can only be read asynchronously.
+    fn take_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
+        for file in dropped {
+            #[cfg(not(target_arch = "wasm32"))]
+            self.start_import(file.path().to_path_buf());
+            #[cfg(target_arch = "wasm32")]
+            {
+                let tx = self.picked_tx.clone();
+                let ctx = ctx.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let name = file.path().to_string_lossy().to_string();
+                    let _ = tx.send((name, file.bytes_async().await));
+                    ctx.request_repaint();
+                });
+            }
+        }
+    }
+
     fn poll_imports(&mut self) {
+        // Queued on an earlier frame, which has drawn the spinner since.
+        #[cfg(target_arch = "wasm32")]
+        for (name, bytes) in std::mem::take(&mut self.queued) {
+            let result = import::import_bytes(&name, &bytes).map_err(|e| format!("{e:#}"));
+            let _ = self.import_tx.send(ImportOutcome {
+                path: PathBuf::from(name),
+                result,
+            });
+        }
+        #[cfg(target_arch = "wasm32")]
+        while let Ok((name, read)) = self.picked_rx.try_recv() {
+            match read {
+                Ok(bytes) => self.queue_bytes(name, bytes),
+                Err(e) => self.status = Some(format!("Couldn't read {name}: {e}")),
+            }
+        }
         while let Ok(outcome) = self.import_rx.try_recv() {
             self.importing = self.importing.saturating_sub(1);
             match outcome.result {
@@ -405,10 +502,9 @@ impl App {
             });
         });
         ui.horizontal(|ui| {
-            if ui.button("+ Import file...").clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_file() {
-                    self.start_import(path);
-                }
+            if ui.button("+ Import file...").on_hover_text("Or drop files onto the window").clicked() {
+                self.pick_file(ui.ctx());
+            }
             if self.importing > 0 {
                 ui.spinner();
             }
@@ -444,6 +540,7 @@ impl App {
         {
             open_export = true;
         }
+        #[cfg(feature = "media")]
         if !self.ffmpeg_available {
             let warn = ui.visuals().warn_fg_color;
             ui.colored_label(warn, "⚠ ffmpeg not found -- video/audio import will fail");
@@ -463,7 +560,7 @@ impl App {
             self.open_export();
         }
         if self.project.sources.is_empty() {
-            ui.weak("No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file.");
+            ui.weak(IMPORT_HINT);
             return;
         }
 
@@ -640,6 +737,15 @@ impl App {
         }
     }
 }
+
+/// What can be imported, which is less in a build without video and audio.
+const IMPORT_HINT: &str = if cfg!(all(feature = "media", feature = "sqlite")) {
+    "No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file."
+} else if cfg!(feature = "sqlite") {
+    "No sources yet. Import a .tlog or a sensor SQLite log."
+} else {
+    "No sources yet. Import a .tlog file, or drop one onto the window."
+};
 
 /// Light, dark, or the desktop's own setting.
 ///
@@ -855,6 +961,7 @@ impl eframe::App for App {
         // panels one frame behind the window.
         ctx.set_theme(self.theme);
         *ui.style_mut() = (*ctx.global_style()).clone();
+        self.take_dropped_files(&ctx);
         self.poll_imports();
         self.handle_shortcuts(&ctx);
 

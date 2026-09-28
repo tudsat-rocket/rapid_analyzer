@@ -1,0 +1,6 @@
+# cargo build output
+/target
+# `trunk build`: the web build (see index.html)
+/dist
+# `nix build .`
+/result

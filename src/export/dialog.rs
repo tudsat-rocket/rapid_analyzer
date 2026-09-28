@@ -9,13 +9,14 @@
 
 use std::collections::HashSet;
 use std::hash::{Hash as _, Hasher as _};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 
 use egui::Vec2;
 
 use super::{
-    ExportFormat, ExportItem, ExportSettings, ExportTheme, FigureRequest, LegendPos, RangeMode, build_figure, export,
-    figure, raster, sanitize_file_name,
+    ExportFormat, ExportItem, ExportSettings, ExportTheme, FigureRequest, LegendPos, RangeMode, build_figure, figure,
+    raster, sanitize_file_name,
 };
 use crate::model::{Project, SourceKind};
 use crate::panes::Plots;
@@ -68,6 +69,7 @@ pub struct ExportDialog {
     error: Option<String>,
     /// What the last export wrote, shown until the next one.
     notice: Option<String>,
+    #[cfg(not(target_arch = "wasm32"))]
     last_dir: Option<PathBuf>,
 }
 
@@ -521,13 +523,40 @@ impl ExportDialog {
         hasher.finish()
     }
 
-    /// Asks for a file and writes it.
+    /// Asks for a file and writes it -- or, in the browser, where there is
+    /// no file system to write to, hands the figure over as a download.
     fn save(&mut self, cx: &DialogContext<'_>, range: (f64, f64)) -> Option<String> {
         let ids = self.ordered_selection(cx);
         let title = ids.first().map_or_else(|| "figure".to_string(), |item| cx.title(*item));
+        let file_name = format!("{}.{}", sanitize_file_name(&title), self.settings.format.extension());
+        let request = FigureRequest {
+            project: cx.project,
+            plots: cx.plots,
+            tanks: cx.tanks,
+            ids: &ids,
+            range,
+            cursor: Some(cx.timeline.cursor),
+        };
+        match self.write(&request, file_name)? {
+            Ok(status) => {
+                self.error = None;
+                self.notice = Some(format!("✔ {status}"));
+                Some(status)
+            }
+            Err(e) => {
+                self.notice = None;
+                self.error = Some(format!("Export failed: {e:#}"));
+                None
+            }
+        }
+    }
+
+    /// `None` when the user cancelled the file dialog.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn write(&mut self, request: &FigureRequest<'_>, file_name: String) -> Option<anyhow::Result<String>> {
         let extension = self.settings.format.extension();
         let mut dialog = rfd::FileDialog::new()
-            .set_file_name(format!("{}.{extension}", sanitize_file_name(&title)))
+            .set_file_name(file_name)
             .add_filter(self.settings.format.label(), &[extension]);
         if let Some(dir) = &self.last_dir {
             dialog = dialog.set_directory(dir);
@@ -541,30 +570,25 @@ impl ExportDialog {
         };
         self.last_dir = path.parent().map(PathBuf::from);
 
-        let request = FigureRequest {
-            project: cx.project,
-            plots: cx.plots,
-            tanks: cx.tanks,
-            ids: &ids,
-            range,
-            cursor: Some(cx.timeline.cursor),
-        };
-        match export(&request, &self.settings, &path) {
-            Ok(written) => {
-                self.error = None;
-                let status = match written.as_slice() {
-                    [one] => format!("Exported {}", one.display()),
-                    many => format!("Exported {} files to {}", many.len(), path.parent().unwrap_or(&path).display()),
-                };
-                self.notice = Some(format!("✔ {status}"));
-                Some(status)
+        Some(super::export(request, &self.settings, &path).map(|written| match written.as_slice() {
+            [one] => format!("Exported {}", one.display()),
+            many => format!("Exported {} files to {}", many.len(), path.parent().unwrap_or(&path).display()),
+        }))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn write(&mut self, request: &FigureRequest<'_>, file_name: String) -> Option<anyhow::Result<String>> {
+        let mime = self.settings.format.mime_type();
+        let result = super::render_files(request, &self.settings, std::path::Path::new(&file_name)).and_then(|files| {
+            for (path, bytes) in &files {
+                crate::web::download(&path.to_string_lossy(), bytes, mime)?;
             }
-            Err(e) => {
-                self.notice = None;
-                self.error = Some(format!("Export failed: {e:#}"));
-                None
-            }
-        }
+            Ok(match files.as_slice() {
+                [(one, _)] => format!("Downloaded {}", one.display()),
+                many => format!("Downloaded {} files", many.len()),
+            })
+        });
+        Some(result)
     }
 
     /// The figure the dialog would write, for tests.

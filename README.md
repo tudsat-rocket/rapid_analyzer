@@ -172,6 +172,39 @@ vendor hash to update when they change.
 > and the derivation applies its own `lib.fileset` allowlist as a second
 > line of defence.
 
+### In a web browser
+
+The same app runs in a browser, for people who want to look at a log
+without installing anything. It is the desktop app built without two cargo
+features, `media` (video and audio: `ffmpeg` and `rodio`) and `sqlite` (the
+SQLite importer, whose bundled C library has no wasm build), so it opens
+**`.tlog` files only**. Everything else — graphs, the tank and phase panes,
+CAN and CANopen, figure export (as a download) — is the same code.
+
+```sh
+rustup target add wasm32-unknown-unknown
+# trunk: `cargo install --locked trunk`, or a prebuilt binary from
+# https://github.com/trunk-rs/trunk/releases
+trunk serve                # http://127.0.0.1:8080, rebuilt on every change
+trunk build --release      # -> dist/, for any static file server
+```
+
+`index.html` is where the features are chosen. `dist/` is plain static files
+(`index.html`, a `.js` and a `.wasm`, about 4 MB gzipped): GitHub Pages, an
+nginx directory or `python3 -m http.server` all serve it. A log is read by the
+browser and never uploaded anywhere. Files come in through "+ Import file..."
+or by dropping them onto the page.
+
+Every push to `main` builds it and publishes it to GitHub Pages
+(`.github/workflows/pages.yml`), at
+<https://tudsat-rocket.github.io/rapid_analyzer/>; pull requests are built
+but not published. The repository needs **Settings → Pages → Build and
+deployment → Source: GitHub Actions** set once for the deployment to go
+through.
+
+The two features can be switched off for a desktop build too:
+`cargo run --no-default-features --features dialect-rapid,serde`.
+
 ## Running
 
 ```sh
@@ -180,7 +213,8 @@ cargo run --release
 cargo run --release -- path/to/log.tlog path/to/telemetry.sqlite path/to/video.mp4
 ```
 
-Use "+ Import file..." in the sidebar to add more sources afterward.
+Use "+ Import file..." in the sidebar, or drop files onto the window, to add
+more sources afterward.
 
 ### Keyboard
 

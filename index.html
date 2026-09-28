@@ -1,0 +1,55 @@
+<!doctype html>
+<!--
+  The web build: `trunk serve` to try it, `trunk build --release` for a dist/
+  directory any static file server can host. It is the desktop app without
+  the `media` and `sqlite` features -- .tlog files only, no video or audio.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rapid-analyzer</title>
+
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="rapid-analyzer"
+      data-cargo-no-default-features
+      data-cargo-features="dialect-rapid,serde"
+      data-wasm-opt="z"
+    />
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #1b1b1b;
+      }
+      @media (prefers-color-scheme: light) {
+        html,
+        body {
+          background: #f8f8f8;
+        }
+      }
+      #rapid_analyzer_canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      #loading {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        font-family: system-ui, sans-serif;
+        color: #888;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="rapid_analyzer_canvas"></canvas>
+    <p id="loading">Loading rapid-analyzer…</p>
+  </body>
+</html>

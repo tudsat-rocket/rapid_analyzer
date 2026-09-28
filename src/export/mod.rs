@@ -91,6 +91,13 @@ impl ExportFormat {
         }
     }
 
+    pub fn mime_type(self) -> &'static str {
+        match self {
+            Self::Svg => "image/svg+xml",
+            Self::Png => "image/png",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Svg => "SVG (vector)",
@@ -439,8 +446,8 @@ fn unit_label<'s>(series: impl Iterator<Item = &'s Prepared>) -> String {
     units.join(" / ")
 }
 
-/// Renders `figure` and writes it to `path`.
-pub fn write_figure(figure: &figure::Figure, settings: &ExportSettings, path: &Path) -> anyhow::Result<()> {
+/// Renders `figure` into the bytes of a file in `settings.format`.
+pub fn render_figure(figure: &figure::Figure, settings: &ExportSettings) -> anyhow::Result<Vec<u8>> {
     let panels = figure.panels.len().max(1);
     let size = settings.size_units(panels);
     let style = settings.style();
@@ -448,39 +455,51 @@ pub fn write_figure(figure: &figure::Figure, settings: &ExportSettings, path: &P
         ExportFormat::Svg => {
             let mut canvas = svg::SvgCanvas::new(size, settings.size_mm(panels));
             figure::draw(&mut canvas, figure, &style);
-            std::fs::write(path, canvas.finish())?;
+            Ok(canvas.finish().into_bytes())
         }
         ExportFormat::Png => {
             let mut canvas = raster::RasterCanvas::new(size, settings.scale())?;
             figure::draw(&mut canvas, figure, &style);
-            std::fs::write(path, canvas.into_png(settings.dpi)?)?;
+            canvas.into_png(settings.dpi)
         }
     }
-    Ok(())
 }
 
-/// Writes every selected graph, either as one stacked figure or as a file
-/// each. Returns what was written, for the status line.
-pub fn export(request: &FigureRequest<'_>, settings: &ExportSettings, path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+/// Renders every selected graph, either as one stacked figure or as a file
+/// each, named after `path`. Nothing is written: the desktop app saves the
+/// files ([`export`]) and the web build offers them as downloads.
+pub fn render_files(
+    request: &FigureRequest<'_>,
+    settings: &ExportSettings,
+    path: &Path,
+) -> anyhow::Result<Vec<(PathBuf, Vec<u8>)>> {
     anyhow::ensure!(!request.ids.is_empty(), "no graphs selected");
     anyhow::ensure!(is_drawable_range(request.range), "the exported time range is empty");
 
     let width_units = mm_to_units(settings.width_mm);
     if !settings.separate_files || request.ids.len() == 1 {
         let figure = build_figure(request, settings, width_units);
-        write_figure(&figure, settings, path)?;
-        return Ok(vec![path.to_path_buf()]);
+        return Ok(vec![(path.to_path_buf(), render_figure(&figure, settings)?)]);
     }
 
-    let mut written = Vec::new();
+    let mut files = Vec::new();
     for (i, id) in request.ids.iter().enumerate() {
         let one = FigureRequest {
             ids: std::slice::from_ref(id),
             ..*request
         };
         let figure = build_figure(&one, settings, width_units);
-        let path = numbered(path, i + 1, settings.format);
-        write_figure(&figure, settings, &path)?;
+        files.push((numbered(path, i + 1, settings.format), render_figure(&figure, settings)?));
+    }
+    Ok(files)
+}
+
+/// Writes every selected graph (see [`render_files`]). Returns what was
+/// written, for the status line.
+pub fn export(request: &FigureRequest<'_>, settings: &ExportSettings, path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut written = Vec::new();
+    for (path, bytes) in render_files(request, settings, path)? {
+        std::fs::write(&path, bytes)?;
         written.push(path);
     }
     Ok(written)

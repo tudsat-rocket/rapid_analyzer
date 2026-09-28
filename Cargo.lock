@@ -3514,6 +3514,7 @@ dependencies = [
  "egui_tiles",
  "env_logger",
  "image",
+ "js-sys",
  "log",
  "mavlink-bindgen",
  "mavlink-core",
@@ -3526,6 +3527,10 @@ dependencies = [
  "serde",
  "serde_arrays",
  "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

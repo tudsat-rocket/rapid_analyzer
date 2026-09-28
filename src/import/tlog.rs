@@ -20,7 +20,13 @@ use crate::series::TimeSeries;
 
 pub fn import(path: &Path) -> Result<LogSource> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = PeekReader::new(BufReader::new(file));
+    import_reader(BufReader::new(file), &path.display().to_string())
+}
+
+/// [`import`] from anything readable -- a file, or the bytes a browser hands
+/// over, which is all the web build ever has. `label` names it in messages.
+pub fn import_reader<R: Read>(reader: R, label: &str) -> Result<LogSource> {
+    let mut reader = PeekReader::new(reader);
 
     let mut collector = Collector::default();
     let mut ts_buf = [0u8; 8];
@@ -53,12 +59,11 @@ pub fn import(path: &Path) -> Result<LogSource> {
         }
     }
 
-    anyhow::ensure!(n_messages > 0, "no valid MAVLink messages found in {}", path.display());
+    anyhow::ensure!(n_messages > 0, "no valid MAVLink messages found in {label}");
 
     let (series, can) = collector.finish();
     log::info!(
-        "{}: {n_messages} messages -> {} series ({} CAN frames)",
-        path.display(),
+        "{label}: {n_messages} messages -> {} series ({} CAN frames)",
         series.len(),
         can.len(),
     );

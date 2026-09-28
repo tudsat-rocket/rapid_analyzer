@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use egui::{Color32, Vec2b, Widget as _};
+use egui::{Color32, Vec2b};
 use egui_plot::{AxisHints, Corner, HPlacement, Legend, Line, Plot, PlotBounds, PlotPoints, VLine};
 
 use crate::audio_playback::AudioPlayback;
@@ -765,6 +765,7 @@ impl<'a> TreeBehavior<'a> {
         }
     }
 
+    #[cfg(feature = "media")]
     fn video_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
         let Some(source) = self.project.source(source_id) else {
             error_label(ui, "source no longer loaded");
@@ -826,7 +827,7 @@ impl<'a> TreeBehavior<'a> {
                 text,
             );
         } else if let Some(texture) = &worker.texture {
-            egui::Image::new(texture).fit_to_exact_size(size).ui(ui);
+            ui.add(egui::Image::new(texture).fit_to_exact_size(size));
         } else if let Some(err) = &worker.error {
             error_label(ui, err);
             // The overwhelmingly common one, and not obvious from ffmpeg's
@@ -839,6 +840,7 @@ impl<'a> TreeBehavior<'a> {
         }
     }
 
+    #[cfg(feature = "media")]
     fn audio_pane(&mut self, ui: &mut egui::Ui, source_id: SourceId) {
         let Some(source) = self.project.source(source_id) else {
             error_label(ui, "source no longer loaded");
@@ -945,6 +947,7 @@ impl<'a> TreeBehavior<'a> {
         (moved && ny1 > ny0).then_some((ny0, ny1))
     }
 
+    #[cfg(feature = "media")]
     fn ensure_audio_player(&mut self, source_id: SourceId, path: &std::path::Path) {
         if self.audio_players.contains_key(&source_id) {
             return;
@@ -1104,8 +1107,12 @@ impl<'a> egui_tiles::Behavior<Pane> for TreeBehavior<'a> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, _tile_id: egui_tiles::TileId, pane: &mut Pane) -> egui_tiles::UiResponse {
         match pane.clone() {
             Pane::Plot(id) => self.plot_pane(ui, id),
+            #[cfg(feature = "media")]
             Pane::Video(id) => self.video_pane(ui, id),
+            #[cfg(feature = "media")]
             Pane::Audio(id) => self.audio_pane(ui, id),
+            #[cfg(not(feature = "media"))]
+            Pane::Video(_) | Pane::Audio(_) => error_label(ui, "video and audio are not part of this build"),
             Pane::Vapor(id) => self.vapor_pane(ui, id),
             Pane::Tank(id) => self.tank_pane(ui, id),
         }

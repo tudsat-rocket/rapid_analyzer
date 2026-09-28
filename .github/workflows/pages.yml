@@ -1,0 +1,77 @@
+# Builds the web version (index.html, via trunk) and publishes it to GitHub
+# Pages on every push to main. Needs Settings -> Pages -> Source set to
+# "GitHub Actions" once; see the README's "In a web browser" section.
+name: Web build (GitHub Pages)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # A re-deploy without a new commit, from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time. A newer push replaces a queued one, but a
+# deployment already running is left to finish rather than cut off halfway.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Prebuilt, because `cargo install trunk` doesn't compile on current
+  # toolchains (its locked libdeflate-sys and lightningcss both break).
+  TRUNK_VERSION: v0.21.14
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+
+      - name: Install trunk
+        run: |
+          curl -sSLf "https://github.com/trunk-rs/trunk/releases/download/${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz -C "$HOME/.cargo/bin" trunk
+          trunk --version
+
+      # Where Pages serves the site from: /<repo>/ for a project page, or the
+      # root of a custom domain. The build has to know, since the .js and
+      # .wasm are referenced by absolute path. Pull requests are never
+      # deployed, so they build for the root.
+      - name: Configure Pages
+        id: pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Build
+        run: trunk build --release --public-url "${{ steps.pages.outputs.base_path }}/"
+
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
+        with:
+          path: dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
