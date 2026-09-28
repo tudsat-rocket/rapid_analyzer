@@ -739,12 +739,10 @@ impl App {
 }
 
 /// What can be imported, which is less in a build without video and audio.
-const IMPORT_HINT: &str = if cfg!(all(feature = "media", feature = "sqlite")) {
+const IMPORT_HINT: &str = if cfg!(feature = "media") {
     "No sources yet. Import a .tlog, a sensor SQLite log, or a video/audio file."
-} else if cfg!(feature = "sqlite") {
-    "No sources yet. Import a .tlog or a sensor SQLite log."
 } else {
-    "No sources yet. Import a .tlog file, or drop one onto the window."
+    "No sources yet. Import a .tlog or a sensor SQLite log, or drop one onto the window."
 };
 
 /// Light, dark, or the desktop's own setting.

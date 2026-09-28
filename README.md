@@ -176,10 +176,17 @@ vendor hash to update when they change.
 
 The same app runs in a browser, for people who want to look at a log
 without installing anything. It is the desktop app built without two cargo
-features, `media` (video and audio: `ffmpeg` and `rodio`) and `sqlite` (the
-SQLite importer, whose bundled C library has no wasm build), so it opens
-**`.tlog` files only**. Everything else — graphs, the tank and phase panes,
-CAN and CANopen, figure export (as a download) — is the same code.
+features, `media` (video and audio: `ffmpeg` and `rodio`) and `sqlite`
+(`rusqlite`, whose bundled C library has no wasm build), so it opens
+**`.tlog` files and SQLite sensor logs**, but no video or audio. The sensor
+logs are read by a small read-only SQLite reader written in Rust
+(`src/import/sqlite_file.rs`). Everything else — graphs, the tank and phase
+panes, CAN and CANopen, figure export (as a download) — is the same code.
+
+A sensor log written in WAL mode keeps its newest rows in a separate
+`-wal` file until SQLite checkpoints them into the database file. The browser
+only ever gets the one file, so copy the log after the logger has closed it
+cleanly (or run `sqlite3 <file> "PRAGMA wal_checkpoint;"` on it first).
 
 ```sh
 rustup target add wasm32-unknown-unknown

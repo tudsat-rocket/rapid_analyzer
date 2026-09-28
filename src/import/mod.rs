@@ -1,6 +1,6 @@
 #[cfg(feature = "media")]
 pub mod audio;
-#[cfg(feature = "sqlite")]
+pub mod sqlite_file;
 pub mod sqlite_log;
 pub mod start_time;
 pub mod tlog;
@@ -49,7 +49,8 @@ pub fn import_path(path: &Path) -> Result<(String, SourceKind)> {
         Some(Format::Sqlite) => Ok((name, SourceKind::Log(sqlite_log::import(path)?))),
         #[cfg(not(feature = "sqlite"))]
         Some(Format::Sqlite) => {
-            bail!("{name}: this build has no SQLite support (it was built without the `sqlite` feature)")
+            let bytes = std::fs::read(path)?;
+            Ok((name, SourceKind::Log(sqlite_log::import_bytes(&bytes, &path.display().to_string())?)))
         }
         None => bail!(
             "couldn't recognize the format of {} (expected .tlog, a sensor_data SQLite log, or a video/audio file)",
@@ -61,7 +62,7 @@ pub fn import_path(path: &Path) -> Result<(String, SourceKind)> {
 /// [`import_path`] for a file that arrives as its contents: what a browser
 /// hands over when a file is picked or dropped, since a web page never sees a
 /// path. Logs only -- video and audio are decoded by `ffmpeg`, which needs a
-/// file on disk, and the SQLite importer is not in the web build.
+/// file on disk.
 pub fn import_bytes(name: &str, bytes: &[u8]) -> Result<(String, SourceKind)> {
     let ext = extension(name);
     if VIDEO_EXTS.contains(&ext.as_str()) || AUDIO_EXTS.contains(&ext.as_str()) {
@@ -69,8 +70,8 @@ pub fn import_bytes(name: &str, bytes: &[u8]) -> Result<(String, SourceKind)> {
     }
     match detect(&ext, bytes) {
         Some(Format::Tlog) => Ok((name.to_string(), SourceKind::Log(tlog::import_reader(bytes, name)?))),
-        Some(Format::Sqlite) => bail!("{name}: SQLite logs can only be opened in the desktop app"),
-        None => bail!("couldn't recognize the format of {name} (expected a .tlog)"),
+        Some(Format::Sqlite) => Ok((name.to_string(), SourceKind::Log(sqlite_log::import_bytes(bytes, name)?))),
+        None => bail!("couldn't recognize the format of {name} (expected a .tlog or a sensor_data SQLite log)"),
     }
 }
 
@@ -174,11 +175,19 @@ mod tests {
 
     #[test]
     fn bytes_refuse_what_only_the_desktop_can_open() {
-        for (name, bytes) in [("clip.mp4", &[0u8; 64][..]), ("sensors", b"SQLite format 3\0 and then some")] {
-            let Err(e) = import_bytes(name, bytes) else {
-                panic!("{name} should have been refused");
-            };
-            assert!(e.to_string().contains("desktop"), "{name}: {e}");
-        }
+        let Err(e) = import_bytes("clip.mp4", &[0; 64]) else {
+            panic!("a video should have been refused");
+        };
+        assert!(e.to_string().contains("desktop"), "{e}");
+    }
+
+    /// Recognised as SQLite by its magic, and then refused as the broken
+    /// database it is -- not mistaken for anything else.
+    #[test]
+    fn bytes_that_look_like_sqlite_go_to_the_sqlite_reader() {
+        let Err(e) = import_bytes("sensors", b"SQLite format 3\0 and then some") else {
+            panic!("a truncated database should have been refused");
+        };
+        assert!(format!("{e:#}").contains("not an SQLite database"), "{e:#}");
     }
 }

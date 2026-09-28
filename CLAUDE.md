@@ -35,7 +35,8 @@ symptom is a spinner that never resolves.
 
 Web build: `trunk serve` / `trunk build --release` (needs the `wasm32-unknown-unknown`
 target). `index.html` builds with `--no-default-features --features dialect-rapid,serde`, i.e.
-without `media` and `sqlite`. Check it compiles with
+without `media` and `sqlite` (SQLite logs still import, through `import/sqlite_file.rs`).
+Check it compiles with
 `cargo clippy --target wasm32-unknown-unknown --no-default-features --features dialect-rapid,serde`.
 `.github/workflows/pages.yml` builds it on every push and PR and deploys `main` to GitHub
 Pages, passing Pages' base path as `--public-url` (the site lives under `/rapid_analyzer/`).
@@ -87,7 +88,11 @@ Imports run on a spawned thread and come back to the UI over an `mpsc` channel (
   dropped; `cdegC`-style units are scaled to the unit they name.
   `CAN_FRAME` is the one message pulled out of that generic path — see "CAN" below.
 - `import/sqlite_log.rs` — pivots long-form `sensor_data(timestamp, sensor_name, value)` rows into
-  one series per `sensor_name`.
+  one series per `sensor_name`. The rows come from `import/sqlite_file.rs`, a read-only SQLite
+  file-format reader in plain Rust (table scan only, no SQL), or with the `sqlite` feature from
+  `rusqlite`. The reader exists for the web build; its tests compare it against `rusqlite` on
+  databases SQLite itself wrote (deep b-trees, overflow pages, whole-number REALs stored as
+  integers, `ALTER TABLE ADD COLUMN`, WAL mode), so run them with the feature on.
 - `import/video.rs`, `import/audio.rs` — shell out to `ffprobe` (metadata) and `ffmpeg` (a
   streamed sequence of downscaled RGBA frames, see `FrameStream`; PCM for the waveform
   envelope). No decoder is linked in.
@@ -236,7 +241,7 @@ would fold every node's traffic into one `CAN_FRAME.data[0]` series. `import/tlo
 ### Features and the web build
 
 `media` (video/audio: `import/{video,audio}.rs`, `video_worker.rs`, `audio_playback.rs`,
-`rodio`) and `sqlite` (`import/sqlite_log.rs`, `rusqlite`) are default features; the web
+`rodio`) and `sqlite` (`rusqlite` in `import/sqlite_log.rs`) are default features; the web
 build turns both off. Without `media`, `lib.rs` swaps `VideoWorker`/`AudioPlayback` for
 uninhabited stub types, so `TreeBehavior`'s slots and `SourceKind::Video`/`Audio` keep
 their shape and nothing outside those files needs a `cfg`. Target-specific code is
@@ -245,7 +250,7 @@ paths, and `std::time::Instant` panics there (use `web_time::Instant`).
 
 In the browser a file is its bytes: picked (`rfd::AsyncFileDialog`) or dropped files are
 read asynchronously, come back over `App::picked_rx`, and go through
-`import::import_bytes` (logs only; `tlog::import_reader` is the shared parser), one frame
+`import::import_bytes` (logs only: `tlog::import_reader`, `sqlite_log::import_bytes`), one frame
 after arrival so the spinner is drawn before the UI thread blocks on the parse. Exports
 go through `export::render_files`, which returns bytes; the desktop writes them, the web
 hands them to `web::download`.

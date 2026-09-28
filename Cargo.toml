@@ -20,7 +20,8 @@ rfd = "0.17.2"
 # Behind the `media` feature, as is everything that shells out to ffmpeg.
 rodio = { version = "0.22.2", optional = true }
 # Behind the `sqlite` feature: `bundled` compiles SQLite from C, which has no
-# wasm32-unknown-unknown build.
+# wasm32-unknown-unknown build. Without it, sensor logs are read by the
+# plain-Rust reader in `import/sqlite_file.rs` instead.
 rusqlite = { version = "0.40.2", features = ["bundled"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_arrays = "0.2.0"
@@ -58,7 +59,9 @@ serde = []
 # frames and waveforms, and `rodio` for playback. Desktop only -- a browser
 # can start neither a process nor a thread.
 media = ["dep:rodio"]
-# The SQLite sensor log importer (`import/sqlite_log.rs`).
+# Read SQLite sensor logs through SQLite itself (`rusqlite`). Off, they are
+# still imported, through `import/sqlite_file.rs` -- which is what the web
+# build does.
 sqlite = ["dep:rusqlite"]
 
 [lints.rust]
