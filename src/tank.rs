@@ -627,6 +627,7 @@ impl TankSpec {
 
         let response = ui.allocate_rect(rect, Sense::click_and_drag());
         self.draw(ui, layout, &field, &readings, window, timeline.cursor);
+        crate::markers::paint(ui, layout.body, window, timeline);
         self.interact(&response, layout, window, &field, timeline, project.time_bounds());
         close
     }
@@ -1204,8 +1205,12 @@ impl TankSpec {
         if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
-            timeline.seek(layout.time_at(pos.x, window), bounds);
-            timeline.playing = false;
+            timeline.click(layout.time_at(pos.x, window), bounds);
+        }
+        if let Some(pos) = response.hover_pos()
+            && layout.body.contains(pos)
+        {
+            timeline.measure.hover(layout.time_at(pos.x, window));
         }
 
         let Some(pos) = response.hover_pos() else {

@@ -196,6 +196,115 @@ fn a_graph_with_a_series_on_each_axis_draws() {
     draw_pane(&mut project, &mut plots, &mut timeline, Pane::Plot(id));
 }
 
+/// Markers and a measured window are painted over every pane on the time
+/// axis, by hand -- including when they sit outside the window, on its edge,
+/// or the window is far narrower than the measurement.
+#[test]
+fn panes_draw_with_markers_and_a_measurement_on_them() {
+    let mut project = project_with_two_scales();
+    let source = project.sources[0].id;
+    let mut plots = Plots::default();
+    let id = plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string());
+    plots.add(id, source, "THRUST.force".to_string(), PlotAxis::Right);
+    let bounds = project.time_bounds();
+    let mut timeline = Timeline::new(bounds.unwrap());
+    for t in [-50.0, 0.0, 12.5, 49.9, 1e9] {
+        timeline.markers.add(t);
+    }
+    timeline.markers.iter_mut().next().unwrap().name.clear();
+    timeline.measure.set_active(true);
+
+    for fixed in [false, true] {
+        timeline.measure.fixed = fixed;
+        // One end placed, then both.
+        for t in [10.0, 30.0] {
+            timeline.click(t, bounds);
+            for view in [(0.0, 49.9), (15.0, 15.001), (100.0, 200.0)] {
+                timeline.set_view(view.0, view.1);
+                draw_pane(&mut project, &mut plots, &mut timeline, Pane::Plot(id));
+                draw(|ui| {
+                    rapid_analyzer::timeline::show(ui, &mut timeline, bounds);
+                });
+            }
+        }
+    }
+
+    let mut project = project_with_a_tank_wall();
+    let mut tanks = Tanks::default();
+    let tank = tanks.create(&project);
+    draw_tank_pane(&mut project, &mut tanks, &mut timeline, Pane::Tank(tank));
+}
+
+/// One frame of a plot pane filling the screen, with these input events.
+fn plot_frame(
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    project: &mut Project,
+    plots: &mut Plots,
+    timeline: &mut Timeline,
+    pane: &Pane,
+) {
+    let mut video_workers = HashMap::new();
+    let mut audio_players = HashMap::new();
+    timeline.begin_frame();
+    frame_with(ctx, events, |ui| {
+        let mut behavior = TreeBehavior {
+            project: &mut *project,
+            plots: &mut *plots,
+            vapors: &mut Vapors::default(),
+            tanks: &mut Tanks::default(),
+            timeline: &mut *timeline,
+            video_workers: &mut video_workers,
+            audio_players: &mut audio_players,
+            closed: Vec::new(),
+        };
+        let _ = behavior.pane_ui(ui, TileId::from_u64(1), &mut pane.clone());
+    });
+}
+
+/// The same click means two things: it moves the playhead, or -- with the
+/// measuring tool on -- it places an end of the window and leaves the
+/// playhead where the user was reading.
+#[test]
+fn a_click_in_a_graph_seeks_or_measures() {
+    let mut project = project_with_two_scales();
+    let source = project.sources[0].id;
+    let mut plots = Plots::default();
+    let pane = Pane::Plot(plots.create(source, "PRESSURE_VESSEL[1].pressure1".to_string()));
+    let mut timeline = Timeline::new(project.time_bounds().unwrap());
+    let ctx = egui::Context::default();
+    // egui hit-tests against the previous frame's widgets, so there has to be one.
+    plot_frame(&ctx, vec![], &mut project, &mut plots, &mut timeline, &pane);
+
+    let mut click = |timeline: &mut Timeline, x: f32| {
+        let pos = egui::pos2(x, 500.0);
+        for events in [vec![egui::Event::PointerMoved(pos), press(pos, true)], vec![press(pos, false)], vec![]] {
+            plot_frame(&ctx, events, &mut project, &mut plots, timeline, &pane);
+        }
+    };
+
+    click(&mut timeline, 700.0);
+    let seeked = timeline.cursor;
+    assert!((15.0..35.0).contains(&seeked), "a click mid-pane seeks to mid-run, got {seeked}");
+    assert_eq!(timeline.measure.ends(), None);
+
+    timeline.measure.set_active(true);
+    // The tool is switched on from the toolbar or the keyboard, so a frame
+    // always passes -- and the readout row appears -- before the next press.
+    click(&mut timeline, 2000.0);
+    click(&mut timeline, 400.0);
+    assert_eq!(timeline.measure.ends(), None, "one end placed");
+    click(&mut timeline, 1000.0);
+    let (a, b) = timeline.measure.ends().expect("two clicks are a measurement");
+    assert!(a < seeked && seeked < b, "{a} .. {b} around {seeked}");
+    assert_eq!(timeline.cursor, seeked, "measuring left the playhead alone");
+
+    // A marker goes on the playhead, and survives being drawn.
+    timeline.add_marker();
+    click(&mut timeline, 1200.0);
+    assert_eq!(timeline.markers.iter().map(|m| m.time).collect::<Vec<_>>(), [seeked]);
+}
+
 #[test]
 fn a_graph_draws_with_everything_on_the_right_axis() {
     let mut project = project_with_two_scales();

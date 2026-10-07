@@ -69,6 +69,18 @@ zoomed together.
 - **Timeline**: play/pause/step, click-to-seek on the scrubber or directly on
   any graph, adjustable playback speed, and keyboard shortcuts for all of it
   (see below).
+- **Markers**: click in a graph to put the playhead on an instant, then
+  "＋ Marker" (or `M`) flags it with a dashed line in every graph, the audio
+  and tank panes and on the scrubber. Every marker gets a colour of its own;
+  "Markers (n)" in the toolbar lists them, to rename, jump to or remove.
+  Markers are drawn into exported figures too.
+- **Measuring**: "Measure" (or `D`) turns clicks into measurements. Two
+  clicks in any graph give the **time between them** (Δt), and every graph
+  shows how far each of its series **moved across that window** -- the
+  difference, the two readings, and the rate per second. Tick "over" and type
+  a length (60 s, say) to measure a **fixed window** from a single click
+  instead: how much the pressure drops in a minute, from wherever you click.
+  `Esc` leaves the tool.
 - **Zooming**: scroll to zoom the time axis, drag to pan. `▣` (or `B`) turns
   on box zoom -- drag a rectangle in any graph to zoom into it, in time *and*
   value; without it, the same works with the right mouse button. `⟲` (or `R`)
@@ -234,6 +246,8 @@ more sources afterward.
 | `+` `-` | zoom the time axis in / out around the playhead |
 | `B` | box zoom: drag a rectangle in a graph to zoom into it |
 | `R` | zoom back out to everything loaded |
+| `M` | place a marker on the playhead |
+| `D` | measuring tool on / off (`Esc` also leaves it) |
 | `Ctrl+E` | export the open graphs as a figure |
 
 Shortcuts are ignored while a text field (the series filter, a graph title)

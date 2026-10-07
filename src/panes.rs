@@ -357,6 +357,8 @@ struct PreparedSeries {
     /// Value range over the visible window, before any normalization.
     bounds: Option<(f64, f64)>,
     at_cursor: Option<f64>,
+    /// Its values at the two ends of the measured window, if there is one.
+    measured: Option<(f64, f64)>,
 }
 
 /// The affine map from a right-axis series' own values into the plot's
@@ -504,6 +506,7 @@ impl<'a> TreeBehavior<'a> {
     fn plot_pane(&mut self, ui: &mut egui::Ui, plot_id: PlotId) {
         let (view_start, view_end) = (self.timeline.view_start, self.timeline.view_end);
         let cursor = self.timeline.cursor;
+        let measured = self.timeline.measure.ends();
 
         let Some(plot) = self.plots.list.iter_mut().find(|p| p.id == plot_id) else {
             error_label(ui, "plot no longer exists");
@@ -548,6 +551,14 @@ impl<'a> TreeBehavior<'a> {
                 points,
                 bounds: entry.correct_bounds(series.value_bounds_in_range(view_start, view_end, offset)),
                 at_cursor: series.value_at(cursor, offset).map(|v| entry.corrected(v)),
+                // The difference of two corrected readings is the difference
+                // of the raw ones, but the readings themselves are shown too.
+                measured: measured.and_then(|(a, b)| {
+                    Some((
+                        entry.corrected(series.value_at(a, offset)?),
+                        entry.corrected(series.value_at(b, offset)?),
+                    ))
+                }),
             });
         }
 
@@ -618,6 +629,34 @@ impl<'a> TreeBehavior<'a> {
                 ui.colored_label(series.color, format!("{}: {v:.4} {unit}", series.short));
             }
         });
+
+        // What the measuring tool found: the window's length, and how far
+        // each series moved across it. Normalizing changes how a line is
+        // drawn, not what it reads, so these stay in the series' own unit.
+        //
+        // The row is there for as long as the tool is on, measurement or
+        // not. The plot below gets its interaction id from how many widgets
+        // came before it, so a row that appeared when the pointer arrived
+        // would change that id between a press and its release -- and a tap,
+        // which arrives and presses in one frame, would never be a click.
+        if self.timeline.measure.active {
+            ui.horizontal_wrapped(|ui| match measured {
+                Some((a, b)) => {
+                    ui.label(format!("Δt {}", crate::markers::format_span(b - a)));
+                    for series in &prepared {
+                        let Some((from, to)) = series.measured else { continue };
+                        let unit = series.unit.as_deref().unwrap_or("");
+                        ui.colored_label(
+                            series.color,
+                            format!("{}: {}", series.short, crate::markers::describe_change(from, to, b - a, unit)),
+                        );
+                    }
+                }
+                None => {
+                    ui.weak("Measuring: click the two instants to compare");
+                }
+            });
+        }
 
         // --- value axes ---
         //
@@ -737,6 +776,7 @@ impl<'a> TreeBehavior<'a> {
                 }
         });
 
+        crate::markers::paint_over_plot(ui, &response, self.timeline);
         let zoomed_y = self.apply_view_change(&response.transform, (y_lo, y_hi), clicked_time);
         if let Some(range) = zoomed_y
             && !normalize
@@ -916,6 +956,7 @@ impl<'a> TreeBehavior<'a> {
                     clicked_time = Some(coord.x);
                 }
         });
+        crate::markers::paint_over_plot(ui, &response, self.timeline);
         self.apply_view_change(&response.transform, (y_lo, y_hi), clicked_time);
 
         if matches!(self.audio_players.get(&source_id), Some(None)) {
@@ -925,7 +966,8 @@ impl<'a> TreeBehavior<'a> {
     }
 
     /// Panning or zooming any plot moves every other pane with it, and a
-    /// click on one moves the playhead.
+    /// click on one moves the playhead -- or, with the measuring tool on,
+    /// places an end of the measured window.
     ///
     /// Returns the value range the user's gesture ended up with, when that is
     /// not the `expected_y` the pane asked for -- a box zoom is the only thing

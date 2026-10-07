@@ -699,7 +699,10 @@ impl App {
                     continue;
                 };
                 // Held arrows should scrub; a held toggle should not flicker.
-                let toggle = matches!(key, egui::Key::Space | egui::Key::B | egui::Key::R);
+                let toggle = matches!(
+                    key,
+                    egui::Key::Space | egui::Key::B | egui::Key::R | egui::Key::M | egui::Key::D | egui::Key::Escape
+                );
                 if *repeat && toggle {
                     continue;
                 }
@@ -727,6 +730,12 @@ impl App {
                         self.plots.clear_manual_ranges();
                     }
                     egui::Key::B if modifiers.is_none() => self.timeline.box_zoom = !self.timeline.box_zoom,
+                    egui::Key::M if modifiers.is_none() => self.timeline.add_marker(),
+                    egui::Key::D if modifiers.is_none() => {
+                        let active = !self.timeline.measure.active;
+                        self.timeline.measure.set_active(active);
+                    }
+                    egui::Key::Escape => self.timeline.measure.set_active(false),
                     egui::Key::E if modifiers.command => open_export = true,
                     _ => {}
                 }
@@ -962,6 +971,7 @@ impl eframe::App for App {
         self.take_dropped_files(&ctx);
         self.poll_imports();
         self.handle_shortcuts(&ctx);
+        self.timeline.begin_frame();
 
         let now = Instant::now();
         let dt = (now - self.last_update).as_secs_f64().min(0.25);

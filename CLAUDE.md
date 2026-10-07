@@ -71,6 +71,33 @@ There is one master timeline in **absolute UTC seconds**, and each source conver
 boundary; `offset_seconds` is applied inside them. Anything that touches a plot's x-axis, a video
 seek, or an audio position must go through them rather than adding timestamps by hand.
 
+### Markers and measuring
+
+`src/markers.rs`: `Markers` and `Measure` both live on `Timeline`, for the reason
+`box_zoom` does -- every pane has to agree on them. Both are drawn by one painter,
+`markers::paint`, *over* the pane rather than as `egui_plot` items, because the tank
+pane is not a plot and a marker has to look the same there. Every pane on the time
+axis therefore calls it (`paint_over_plot` for an `egui_plot`, which also reports the
+hovered time); a new time-axis pane has to as well.
+
+- **Clicks.** `Timeline::click` is the one place a click on the time axis is
+  interpreted: an end of the measured window while the tool is on, a seek otherwise.
+  `follow_plot` and the tank's `interact` both go through it.
+- **A measurement is two times, not two points.** Each graph reads its own series at
+  the two ends (`PreparedSeries::measured`, through the entry's value offset), which
+  is what lets one gesture give Δt, Δvalue and a rate, and a fixed span
+  (`Measure::fixed`/`span`) give "per minute" from one click.
+- **Hover is a frame late on purpose.** The half-placed window follows the pointer,
+  but the hovered pane may be drawn after the others, so it writes `hover_next` and
+  `Timeline::begin_frame` (called once per frame in `App::ui`) hands it to everyone.
+- **Colours.** `colors::marker_color(n)` walks the hue wheel by the golden angle and
+  brings every hue to one luminance, so no colour repeats and each clears contrast in
+  both themes and on a white page. `Markers::placed` only counts up, so a deleted
+  marker's colour is not reissued. Markers are dashed so none reads as the playhead.
+- **Export.** `FigureRequest::markers` -> `Figure::markers`, drawn by
+  `figure::draw_markers` in graph and tank panels alike, switched by
+  `ExportSettings::markers`. They are part of the dialog's `preview_key`.
+
 ### Import
 
 `import::import_path` (`src/import/mod.rs`) dispatches by extension, falling back to content

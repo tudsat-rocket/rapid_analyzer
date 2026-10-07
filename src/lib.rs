@@ -8,6 +8,7 @@ pub mod colors;
 pub mod dialect;
 pub mod export;
 pub mod import;
+pub mod markers;
 pub mod mavlink_meta;
 pub mod model;
 pub mod n2o;

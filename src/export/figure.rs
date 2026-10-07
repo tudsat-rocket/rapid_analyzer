@@ -11,6 +11,8 @@
 
 use egui::{Align2, Color32, Pos2, Rect, Vec2, pos2, vec2};
 
+use crate::markers::Marker;
+
 /// Where a figure's ink goes. Positions and sizes are in figure units.
 pub trait Canvas {
     /// The whole drawable area.
@@ -129,6 +131,8 @@ pub struct Figure {
     pub range: (f64, f64),
     /// The playhead, if it is to be marked and falls inside `range`.
     pub cursor: Option<f64>,
+    /// The user's markers. Those outside `range` are simply not drawn.
+    pub markers: Vec<Marker>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -161,6 +165,7 @@ pub struct Style {
     pub legend: LegendPos,
     pub titles: bool,
     pub cursor: bool,
+    pub markers: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -507,6 +512,7 @@ fn draw_graph(
             style.line_width,
         );
     }
+    draw_markers(canvas, figure, plot, plot.top(), plot.bottom(), m);
     canvas.clip(None);
 
     canvas.stroke_rect(plot, p.frame, (style.line_width * 0.6).max(0.5));
@@ -528,6 +534,38 @@ fn draw_graph(
 /// heights. The vessel's dished ends are drawn *inside* the rect rather than
 /// outside it, so the strip lines up with the graphs above it rather than the
 /// vessel's outline doing.
+/// The user's markers across one panel, from `top` to `bottom`: dashed, as
+/// they are on screen, so none of them reads as the playhead, and named
+/// beside the line in the marker's own colour.
+fn draw_markers(canvas: &mut dyn Canvas, figure: &Figure, plot: Rect, top: f32, bottom: f32, m: &Metrics<'_>) {
+    let style = m.style;
+    if !style.markers {
+        return;
+    }
+    let (t0, t1) = figure.range;
+    let (dash, gap) = (style.line_width * 5.0, style.line_width * 3.0);
+    for marker in figure.markers.iter().filter(|marker| (t0..=t1).contains(&marker.time)) {
+        let x = plot.left() + ((marker.time - t0) / (t1 - t0)) as f32 * plot.width();
+        let mut y = top;
+        while y < bottom {
+            canvas.polyline(&[pos2(x, y), pos2(x, (y + dash).min(bottom))], marker.color, style.line_width);
+            y += dash + gap;
+        }
+        if marker.name.is_empty() {
+            continue;
+        }
+        // On whichever side of the line there is room for it.
+        let font = style.font * 0.85;
+        let width = text_room(canvas, &marker.name, font);
+        let (anchor, align) = if x + m.gap * 0.4 + width <= plot.right() {
+            (pos2(x + m.gap * 0.4, top + m.gap * 0.3), Align2::LEFT_TOP)
+        } else {
+            (pos2(x - m.gap * 0.4, top + m.gap * 0.3), Align2::RIGHT_TOP)
+        };
+        canvas.text(anchor, align, &marker.name, font, marker.color);
+    }
+}
+
 fn draw_tank(canvas: &mut dyn Canvas, figure: &Figure, tank: &Tank, plot: Rect, m: &Metrics<'_>) {
     use crate::tank::TANK_SENSORS;
 
@@ -562,6 +600,7 @@ fn draw_tank(canvas: &mut dyn Canvas, figure: &Figure, tank: &Tank, plot: Rect, 
         let x = plot.left() + ((cursor - t0) / (t1 - t0)) as f32 * plot.width();
         canvas.polyline(&[pos2(x, body.top()), pos2(x, body.bottom())], p.cursor, style.line_width);
     }
+    draw_markers(canvas, figure, plot, body.top(), body.bottom(), m);
     canvas.clip(None);
 
     // The dished ends, which are what make the strip read as a vessel seen

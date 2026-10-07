@@ -409,6 +409,8 @@ impl ExportDialog {
         ui.checkbox(&mut self.settings.titles, "Graph titles");
         ui.checkbox(&mut self.settings.cursor, "Mark the playhead")
             .on_hover_text("Draw the line the playhead is on, if it falls inside the exported window");
+        ui.checkbox(&mut self.settings.markers, "Draw the markers")
+            .on_hover_text("Draw the markers that fall inside the exported window, with their names");
         ui.checkbox(&mut self.settings.auto_fit_y, "Fit the value axes to this window")
             .on_hover_text("Off: keep the value range the graph is showing, including one pinned by a box zoom");
     }
@@ -465,6 +467,7 @@ impl ExportDialog {
             ids,
             range,
             cursor: Some(cx.timeline.cursor),
+            markers: cx.timeline.markers.as_slice(),
         };
         let size = self.settings.size_units(ids.len());
         let figure = build_figure(&request, &self.settings, size.x);
@@ -489,6 +492,11 @@ impl ExportDialog {
         range.0.to_bits().hash(&mut hasher);
         range.1.to_bits().hash(&mut hasher);
         cx.timeline.cursor.to_bits().hash(&mut hasher);
+        for marker in cx.timeline.markers.iter() {
+            marker.time.to_bits().hash(&mut hasher);
+            marker.color.to_array().hash(&mut hasher);
+            marker.name.hash(&mut hasher);
+        }
         for item in self.ordered_selection(cx) {
             item.hash(&mut hasher);
             cx.title(item).hash(&mut hasher);
@@ -536,6 +544,7 @@ impl ExportDialog {
             ids: &ids,
             range,
             cursor: Some(cx.timeline.cursor),
+            markers: cx.timeline.markers.as_slice(),
         };
         match self.write(&request, file_name)? {
             Ok(status) => {
@@ -602,6 +611,7 @@ impl ExportDialog {
             ids: &ids,
             range,
             cursor: None,
+            markers: cx.timeline.markers.as_slice(),
         };
         build_figure(&request, &self.settings, super::mm_to_units(self.settings.width_mm))
     }

@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use egui::{Color32, Vec2};
 
+use crate::markers::Marker;
 use crate::model::{Project, SourceKind};
 use crate::panes::{AxisMap, PlotAxis, PlotId, PlotSpec, Plots};
 use crate::tank::{TankId, TankSpec, Tanks};
@@ -143,6 +144,8 @@ pub struct ExportSettings {
     pub legend: LegendPos,
     pub titles: bool,
     pub cursor: bool,
+    /// Draw the markers that fall inside the exported window.
+    pub markers: bool,
     /// Ignore the value range a box zoom pinned, and fit the axes to what the
     /// exported window actually holds.
     pub auto_fit_y: bool,
@@ -173,6 +176,9 @@ impl Default for ExportSettings {
             legend: LegendPos::TopLeft,
             titles: true,
             cursor: false,
+            // Unlike the playhead, which is wherever it was left, a marker
+            // was put there on purpose.
+            markers: true,
             auto_fit_y: false,
             separate_files: false,
             range: RangeMode::View,
@@ -223,6 +229,7 @@ impl ExportSettings {
             legend: self.legend,
             titles: self.titles,
             cursor: self.cursor,
+            markers: self.markers,
         }
     }
 
@@ -249,6 +256,7 @@ pub struct FigureRequest<'a> {
     pub ids: &'a [ExportItem],
     pub range: (f64, f64),
     pub cursor: Option<f64>,
+    pub markers: &'a [Marker],
 }
 
 /// Turns the app's plots into a figure.
@@ -279,6 +287,7 @@ pub fn build_figure(request: &FigureRequest<'_>, settings: &ExportSettings, widt
         panels,
         range: request.range,
         cursor: request.cursor,
+        markers: request.markers.to_vec(),
     }
 }
 
@@ -632,6 +641,7 @@ mod tests {
             ids,
             range: (0.0, 50.0),
             cursor: Some(10.0),
+            markers: &[],
         };
         export(&request, settings, path).expect("the figure was written");
     }
@@ -661,6 +671,7 @@ mod tests {
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
         let graph = graph_of(&figure, 0);
@@ -686,6 +697,7 @@ mod tests {
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
         let graph = graph_of(&figure, 0);
@@ -716,6 +728,7 @@ mod tests {
             ids: &ids[..1],
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let kept = build_figure(&request, &ExportSettings::default(), 600.0);
         assert_eq!(graph_of(&kept, 0).left, (39.0, 41.0));
@@ -746,6 +759,7 @@ mod tests {
             ids: &ids,
             range: (0.0, 50.0),
             cursor: Some(10.0),
+            markers: &[],
         };
 
         let svg_path = dir.join("figure.svg");
@@ -772,6 +786,51 @@ mod tests {
     }
 
     #[test]
+    fn markers_inside_the_window_are_drawn_and_named() {
+        let project = project();
+        let (plots, ids) = two_plots(&project);
+        let mut markers = crate::markers::Markers::default();
+        markers.add(20.0);
+        markers.add(400.0);
+        let mut names = ["ignition", "long after the window"].into_iter();
+        for marker in markers.iter_mut() {
+            marker.name = names.next().unwrap().to_string();
+        }
+        let request = FigureRequest {
+            project: &project,
+            plots: &plots,
+            tanks: &Tanks::default(),
+            ids: &ids[..1],
+            range: (0.0, 50.0),
+            cursor: None,
+            markers: markers.as_slice(),
+        };
+        let svg = |settings: &ExportSettings| {
+            let files = render_files(&request, settings, Path::new("figure.svg")).unwrap();
+            String::from_utf8(files[0].1.clone()).unwrap()
+        };
+
+        let with = svg(&ExportSettings::default());
+        assert!(with.contains("ignition"), "the marker is named in the figure");
+        assert!(!with.contains("long after the window"));
+        let without = svg(&ExportSettings {
+            markers: false,
+            ..Default::default()
+        });
+        assert!(!without.contains("ignition"));
+        // Dashed: a marker is many short strokes, not one line.
+        assert!(with.matches("<polyline").count() > without.matches("<polyline").count() + 5);
+
+        // ... and the raster backend draws the same figure without complaint.
+        let png = ExportSettings {
+            format: ExportFormat::Png,
+            dpi: 96.0,
+            ..Default::default()
+        };
+        render_files(&request, &png, Path::new("figure.png")).unwrap();
+    }
+
+    #[test]
     fn one_file_per_graph_writes_one_file_per_graph() {
         let project = project();
         let (plots, ids) = two_plots(&project);
@@ -783,6 +842,7 @@ mod tests {
             ids: &ids,
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let settings = ExportSettings {
             separate_files: true,
@@ -810,6 +870,7 @@ mod tests {
             ids: &[],
             range: (0.0, 1.0),
             cursor: None,
+            markers: &[],
         };
         assert!(export(&request, &ExportSettings::default(), &dir.join("x.svg")).is_err());
 
@@ -822,6 +883,7 @@ mod tests {
             ids: &ids,
             range: (50.0, 0.0),
             cursor: None,
+            markers: &[],
         };
         assert!(export(&backwards, &ExportSettings::default(), &dir.join("x.svg")).is_err());
 
@@ -850,6 +912,7 @@ mod tests {
                 ids: &ids[..1],
                 range: (0.0, 50.0),
                 cursor: None,
+                markers: &[],
             };
             build_figure(&request, &ExportSettings::default(), 600.0)
         };
@@ -893,6 +956,7 @@ mod tests {
                 ids: &ids,
                 range: (0.0, 50.0),
                 cursor: Some(10.0),
+                markers: &[],
             };
             build_figure(&request, &settings, 600.0)
         };
@@ -953,6 +1017,7 @@ mod tests {
             ids: &ids,
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let size = settings.size_units(1);
         let figure = build_figure(&request, &settings, size.x);
@@ -985,6 +1050,7 @@ mod tests {
             ids: &[id],
             range: (0.0, 50.0),
             cursor: None,
+            markers: &[],
         };
         let figure = build_figure(&request, &ExportSettings::default(), 600.0);
         assert_eq!(figure.panels.len(), 1);

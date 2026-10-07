@@ -756,6 +756,7 @@ impl VaporSpec {
             }
         });
 
+        crate::markers::paint_over_plot(ui, &response, timeline);
         let x = response.transform.bounds();
         timeline.follow_plot(x.min()[0], x.max()[0], clicked_time, bounds);
     }

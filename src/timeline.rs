@@ -1,5 +1,7 @@
 use egui::{Color32, Rect, Sense, Stroke, Vec2};
 
+use crate::markers::{Markers, Measure, format_span};
+
 /// Narrowest visible window, in seconds. Zooming past a millisecond says
 /// nothing about data logged at a few hundred hertz, and a window that
 /// reaches zero width can't be zoomed back out.
@@ -25,6 +27,11 @@ pub struct Timeline {
     /// the app because every pane has to agree on it, and the panes already
     /// share this struct.
     pub box_zoom: bool,
+    /// Instants the user has flagged. Here for the same reason: every pane
+    /// on the time axis draws them.
+    pub markers: Markers,
+    /// The measuring tool, and the window it has measured.
+    pub measure: Measure,
 }
 
 impl Timeline {
@@ -36,6 +43,31 @@ impl Timeline {
             playing: false,
             speed: 1.0,
             box_zoom: false,
+            markers: Markers::default(),
+            measure: Measure::default(),
+        }
+    }
+
+    /// Once per frame, before any pane is drawn: hands the panes what the
+    /// pointer was over last frame. A pane drawn before the hovered one would
+    /// otherwise never see it.
+    pub fn begin_frame(&mut self) {
+        self.measure.begin_frame();
+    }
+
+    /// Flags the instant the playhead is on.
+    pub fn add_marker(&mut self) {
+        self.markers.add(self.cursor);
+    }
+
+    /// A click at `t` in any pane on the time axis: an end of the measured
+    /// window while the measuring tool is on, and a seek otherwise.
+    pub fn click(&mut self, t: f64, bounds: Option<(f64, f64)>) {
+        if self.measure.active {
+            self.measure.click(t);
+        } else {
+            self.seek(t, bounds);
+            self.playing = false;
         }
     }
 
@@ -111,15 +143,14 @@ impl Timeline {
     }
 
     /// Adopts the x range a plot pane came back with -- a pan, a scroll zoom
-    /// or a box selection -- and a click on it as a seek. Every pane on the
+    /// or a box selection -- and a click on it (see [`Self::click`]). Every pane on the
     /// time axis goes through this, which is what keeps them in step.
     pub fn follow_plot(&mut self, x0: f64, x1: f64, clicked: Option<f64>, bounds: Option<(f64, f64)>) {
         if (x0 - self.view_start).abs() > 1e-6 || (x1 - self.view_end).abs() > 1e-6 {
             self.set_view(x0, x1);
         }
         if let Some(t) = clicked {
-            self.seek(t, bounds);
-            self.playing = false;
+            self.click(t, bounds);
         }
     }
 
@@ -208,7 +239,9 @@ pub fn format_duration(seconds: f64) -> String {
 pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(f64, f64)>) -> bool {
     let mut changed = false;
 
-    ui.horizontal(|ui| {
+    // Wrapped: with the marker and measuring tools the row no longer fits a
+    // narrow window, and a toolbar that runs off the edge hides its clock.
+    ui.horizontal_wrapped(|ui| {
         let play_label = if timeline.playing { "⏸" } else { "▶" };
         if ui.button("⏮").on_hover_text("Jump to start  (Home)").clicked()
             && let Some((lo, _)) = project_bounds {
@@ -259,6 +292,11 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
             ui.label(format!("(t+{})", format_duration(timeline.cursor - lo)));
             ui.label(format!("/ {}", format_duration(hi - lo)));
         }
+
+        ui.separator();
+        changed |= marker_tools(ui, timeline, project_bounds);
+        ui.separator();
+        measure_tools(ui, timeline);
     });
 
     let Some((lo, hi)) = project_bounds else {
@@ -285,6 +323,15 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
     );
     painter.rect_filled(view_rect, 2.0, ui.visuals().selection.bg_fill.gamma_multiply(0.35));
 
+    // Markers, as ticks: enough to find one again from the far end of a run.
+    for marker in timeline.markers.iter().filter(|m| (lo..=hi).contains(&m.time)) {
+        let x = t_to_x(marker.time);
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            Stroke::new(1.5, marker.color),
+        );
+    }
+
     // Playhead.
     let cursor_x = t_to_x(timeline.cursor.clamp(lo, hi));
     painter.line_segment(
@@ -303,9 +350,135 @@ pub fn show(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(
     changed
 }
 
+/// The marker button and the list behind it. Returns `true` if a marker was
+/// jumped to.
+fn marker_tools(ui: &mut egui::Ui, timeline: &mut Timeline, project_bounds: Option<(f64, f64)>) -> bool {
+    if ui
+        .button("＋ Marker")
+        .on_hover_text("Mark the instant the playhead is on, in every graph  (M)\nClick in a graph to put the playhead there first.")
+        .clicked()
+    {
+        timeline.add_marker();
+    }
+
+    let mut jump = None;
+    let mut remove = None;
+    let mut clear = false;
+    // A form menu, not a plain one: the names are text fields.
+    crate::panes::form_menu(ui, format!("Markers ({})", timeline.markers.len()), |ui| {
+        ui.set_min_width(300.0);
+        if timeline.markers.is_empty() {
+            ui.weak("No markers yet. Click in a graph, then press M.");
+            return;
+        }
+        egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+            for marker in timeline.markers.iter_mut() {
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), Sense::hover());
+                    ui.painter().rect_filled(rect, 2.0, marker.color);
+                    ui.add(egui::TextEdit::singleline(&mut marker.name).desired_width(70.0));
+                    if ui
+                        .button(egui::RichText::new(format_utc(marker.time)).monospace())
+                        .on_hover_text("Move the playhead here")
+                        .clicked()
+                    {
+                        jump = Some(marker.time);
+                    }
+                    if ui.small_button("✖").on_hover_text("Remove this marker").clicked() {
+                        remove = Some(marker.id);
+                    }
+                });
+            }
+        });
+        ui.separator();
+        if ui.button("Remove all").clicked() {
+            clear = true;
+        }
+    });
+
+    if let Some(id) = remove {
+        timeline.markers.remove(id);
+    }
+    if clear {
+        timeline.markers.clear();
+    }
+    if let Some(t) = jump {
+        timeline.jump_to(t, project_bounds);
+        timeline.playing = false;
+    }
+    jump.is_some()
+}
+
+/// The measuring tool's switch, its fixed-span setting, and what it measured.
+fn measure_tools(ui: &mut egui::Ui, timeline: &mut Timeline) {
+    let measure = &mut timeline.measure;
+    let mut active = measure.active;
+    if ui
+        .toggle_value(&mut active, "Measure")
+        .on_hover_text(
+            "Measure between two instants  (D)\nClick twice in any graph: the time between the clicks, and how far \
+             each series moved across it, are shown in every graph.\nWhile on, a click measures instead of moving the playhead.",
+        )
+        .changed()
+    {
+        measure.set_active(active);
+    }
+    if !measure.active {
+        return;
+    }
+    ui.checkbox(&mut measure.fixed, "over")
+        .on_hover_text("Measure a window of a fixed length from a single click -- how far each series moves in, say, a minute");
+    ui.add_enabled(
+        measure.fixed,
+        egui::DragValue::new(&mut measure.span)
+            .speed(0.5)
+            .range(MIN_VIEW_SPAN..=f64::MAX)
+            .max_decimals(3)
+            .suffix(" s"),
+    )
+    .on_hover_text("Length of the fixed window. Click to type a number, or drag.");
+    match measure.ends() {
+        Some((a, b)) => {
+            ui.monospace(format!("Δt {}", format_span(b - a)));
+            if ui.small_button("✖").on_hover_text("Forget this measurement  (Esc leaves the tool)").clicked() {
+                measure.clear();
+            }
+        }
+        None => {
+            ui.weak("click in a graph");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_measures_while_the_tool_is_on_and_seeks_otherwise() {
+        let mut t = Timeline::new((0.0, 100.0));
+        t.playing = true;
+        t.click(30.0, Some((0.0, 100.0)));
+        assert_eq!(t.cursor, 30.0);
+        assert!(!t.playing);
+
+        t.measure.set_active(true);
+        t.click(50.0, Some((0.0, 100.0)));
+        t.click(80.0, Some((0.0, 100.0)));
+        assert_eq!(t.cursor, 30.0, "measuring must not move the playhead");
+        assert_eq!(t.measure.ends(), Some((50.0, 80.0)));
+    }
+
+    #[test]
+    fn a_marker_goes_where_the_playhead_is() {
+        let mut t = Timeline::new((0.0, 100.0));
+        t.seek(42.0, Some((0.0, 100.0)));
+        t.add_marker();
+        // Pressed again without moving: still one marker.
+        t.add_marker();
+        let times: Vec<f64> = t.markers.iter().map(|m| m.time).collect();
+        assert_eq!(times, [42.0]);
+    }
 
     #[test]
     fn zooming_keeps_the_centre_where_it_was() {
