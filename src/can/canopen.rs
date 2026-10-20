@@ -79,6 +79,8 @@ impl DataType {
 pub enum Access {
     ReadOnly,
     ReadWrite,
+    /// `0x2037`: a read aborts.
+    WriteOnly,
 }
 
 impl Access {
@@ -86,6 +88,7 @@ impl Access {
         match self {
             Self::ReadOnly => "ro",
             Self::ReadWrite => "rw",
+            Self::WriteOnly => "wo",
         }
     }
 }
@@ -104,6 +107,14 @@ pub enum Element {
     Actuator,
     /// `0x3040`: one period per TPDO kind, in wire order.
     Tpdo,
+    /// `0x2007`: the STM32's own ADC pins, in `0x3028`'s order.
+    AnalogInput,
+    /// `0x2042`: the on-board thermistor, then the MCU die sensor.
+    BoardTemperature,
+    /// `0x2050`: `iocan-proto`'s `ErrorCounter`, in sub-index order.
+    ErrorCounter,
+    /// `0x2051`: `iocan-proto`'s `ErrorCategory`, in sub-index order.
+    ErrorCategory,
     /// `0x1010` / `0x1011`: sub 1 is "all parameters".
     Parameters,
 }
@@ -122,6 +133,10 @@ impl Element {
                 .get(entry)
                 .map_or_else(|| format!("kind {entry}"), |k| k.name().to_string()),
             Self::Parameters => "all".to_string(),
+            Self::AnalogInput => named(ANALOG_INPUT, entry, "input"),
+            Self::BoardTemperature => named(&["TH1", "MCU"], entry, "sensor"),
+            Self::ErrorCounter => named(ERROR_COUNTER, entry, "counter"),
+            Self::ErrorCategory => named(&iocan::ERROR_CATEGORY, entry, "category"),
         }
     }
 
@@ -129,10 +144,21 @@ impl Element {
     fn tag(self, entry: usize) -> String {
         match self {
             Self::Hco => format!("hco{}", entry + 1),
-            Self::Rail | Self::Tpdo => self.label(entry).to_lowercase(),
+            Self::Rail | Self::Tpdo | Self::BoardTemperature | Self::ErrorCounter | Self::ErrorCategory => {
+                self.label(entry).to_lowercase()
+            }
+            Self::AnalogInput => ["com5_1", "com5_2", "com6_1", "com6_2", "th1"]
+                .get(entry)
+                .map_or_else(|| entry.to_string(), |t| t.to_string()),
             _ => entry.to_string(),
         }
     }
+}
+
+fn named(names: &[&str], entry: usize, fallback: &str) -> String {
+    names
+        .get(entry)
+        .map_or_else(|| format!("{fallback} {entry}"), |n| n.to_string())
 }
 
 /// How a raw value reads to a person.
@@ -300,14 +326,58 @@ pub const LINK_STATE: &[&str] = &[
     "suspended (raw debug or fallback off)",
 ];
 pub const RELIEF_STATE: &[&str] = &["idle", "relieving", "cooldown", "inhibited", "disabled"];
-const UNIT_CODE: &[&str] = &["centibar", "decibar", "centi-°C", "raw counts"];
+const UNIT_CODE: &[&str] = &["centibar", "decibar", "centi-°C", "raw counts", "promille"];
+/// Current firmware knows 0..=2; "stepper" is kept for logs from boards that had one.
 const VALVE_KIND: &[&str] = &["not fitted", "solenoid", "servo", "stepper"];
-const SENSOR_KIND: &[&str] = &["unused", "pressure (linear)", "Pt1000 temperature"];
+const SENSOR_KIND: &[&str] = &[
+    "unused",
+    "pressure (linear)",
+    "Pt1000 temperature",
+    "MCP9700 temperature",
+    "AS5600 rotary encoder",
+    "10k NTC, to ground",
+    "10k NTC, to +3.3V",
+    "on-board thermistor TH1",
+];
+const ANALOG_INPUT: &[&str] = &["COM5 pin 1", "COM5 pin 2", "COM6 pin 1", "COM6 pin 2", "TH1"];
+const HEATING_STATE: &[&str] = &["idle", "heating", "sensor fault", "disabled"];
+/// `iocan-proto`'s `ErrorCounter`. Append-only there: the position is the
+/// sub-index minus one.
+const ERROR_COUNTER: &[&str] = &[
+    "i2c_timeout",
+    "i2c_bus_error",
+    "i2c_nack",
+    "i2c_device_lost",
+    "amplifier_read_failed",
+    "amplifier_alert",
+    "encoder_read_failed",
+    "encoder_magnet_lost",
+    "sensor_source_missing",
+    "can_rx_overrun",
+    "can_rx_error",
+    "can_rx_dropped",
+    "can_tx_dropped",
+    "can_tx_invalid",
+    "sdo_request_invalid",
+    "sdo_write_rejected",
+    "sdo_response_dropped",
+    "valve_stall",
+    "relief_inhibited",
+    "config_flash_error",
+    "config_invalid",
+    "watchdog_late",
+    "control_tick_overrun",
+    "cpu_load_high",
+    "can_error_passive",
+    "can_bus_off",
+    "can_error_count_rose",
+    "sensor_missing_at_boot",
+];
 const HCO_NUMBER: &[&str] = &["none", "HCO1", "HCO2", "HCO3", "HCO4"];
 const HCO_OWNER: &[&str] = &["free", "valve 0", "valve 1", "valve 2", "valve 3"];
 const OFF_ON: &[&str] = &["off", "on"];
 
-use Access::{ReadOnly as RO, ReadWrite as RW};
+use Access::{ReadOnly as RO, ReadWrite as RW, WriteOnly as WO};
 use DataType::{I16, I32, U8, U16, U32};
 
 /// Every object a node answers for, sorted by index.
@@ -334,12 +404,20 @@ pub const DICTIONARY: &[ObjectDef] = &[
         .format(Format::Bits),
     var(0x2003, "i2c_sweeps", "completed i2c presence sweeps", U32, RO),
     var(0x2004, "sensor_value", "calibrated sensor values (unit: 0x2005)", I16, RO)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .format(Format::Reading(i16::MIN as i64))
         .unit("counts"),
     var(0x2005, "sensor_unit", "unit code per sensor slot", U8, RO)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .format(Format::Enum(UNIT_CODE)),
+    var(0x2006, "raw_encoder", "raw AS5600 angle per i2c bus (0..4095 a turn)", U16, RO)
+        .array(2, Element::I2cBus)
+        .format(Format::Reading(0xFFFF))
+        .unit("counts"),
+    var(0x2007, "raw_analog", "raw ADC counts on the COM5/COM6 pins and TH1", U16, RO)
+        .array(5, Element::AnalogInput)
+        .format(Format::Reading(0xFFFF))
+        .unit("counts"),
     var(0x2010, "valve_commanded", "valve commanded state", U16, RW)
         .array(4, Element::Valve)
         .format(Format::Position),
@@ -359,6 +437,9 @@ pub const DICTIONARY: &[ObjectDef] = &[
     var(0x2016, "stepper_position", "stepper position, steps since boot", I32, RW)
         .array(2, Element::Actuator)
         .unit("steps"),
+    var(0x2019, "valve_heating_state", "valve heating pad state", U8, RO)
+        .array(4, Element::Valve)
+        .format(Format::Enum(HEATING_STATE)),
     var(0x2020, "hco_digital", "high current output, digital level", U8, RW)
         .array(4, Element::Hco)
         .format(Format::Enum(OFF_ON)),
@@ -372,12 +453,26 @@ pub const DICTIONARY: &[ObjectDef] = &[
     var(0x2031, "raw_debug", "raw debug mode (volatile)", U8, RW).format(Format::Enum(OFF_ON)),
     var(0x2032, "link_state", "master link state", U8, RO).format(Format::Enum(LINK_STATE)),
     var(0x2033, "ms_since_heartbeat", "time since last master heartbeat", U32, RO).unit("ms"),
+    var(0x2034, "cpu_load", "cpu load, worst window of the period", U16, RO)
+        .format(Format::Reading(0xFFFF))
+        .unit("‰"),
+    var(0x2035, "control_tick_peak_us", "worst control loop iteration of the period", U16, RO).unit("us"),
+    var(0x2036, "com4_go", "COM4 \"GO\" beacon (volatile)", U8, RW).format(Format::Enum(OFF_ON)),
+    var(0x2037, "reboot", "reboot (write > 0)", U8, WO),
     var(0x2040, "rail_current", "rail current", U16, RO)
         .array(3, Element::Rail)
         .unit("mA"),
     var(0x2041, "rail_voltage", "rail voltage", U16, RO)
         .array(3, Element::Rail)
         .unit("mV"),
+    var(0x2042, "temperature", "board temperatures (TH1, MCU die)", I16, RO)
+        .array(2, Element::BoardTemperature)
+        .format(Format::Reading(i16::MIN as i64))
+        .unit("centi-°C"),
+    var(0x2050, "error_counters", "error counters, one per failure kind", U32, RO)
+        .array(ERROR_COUNTER.len() as u8, Element::ErrorCounter),
+    var(0x2051, "error_summary", "error summary, bad 250 ms windows per category", U16, RO)
+        .array(iocan::ERROR_CATEGORY.len() as u8, Element::ErrorCategory),
     // --- 0x3000: runtime configuration, persisted on "save" ---
     var(0x3000, "master_node_id", "master node id", U8, RW),
     var(0x3001, "fallback_a_ms", "fallback stage A timeout", U32, RW).unit("ms"),
@@ -428,29 +523,38 @@ pub const DICTIONARY: &[ObjectDef] = &[
     var(0x301A, "valve_max_promille", "valve maximum commandable position", U16, RW)
         .array(4, Element::Valve)
         .unit("‰"),
-    var(0x3020, "sensor_bus", "sensor slot source bus (0xFF = unused)", U8, RW)
-        .array(8, Element::Slot)
+    var(0x301B, "valve_position_sensor", "valve position sensor slot (0xFF = none)", U8, RW)
+        .array(4, Element::Valve)
         .format(Format::IndexOrNone),
-    var(0x3021, "sensor_amplifier", "sensor slot source amplifier index", U8, RW).array(8, Element::Slot),
+    var(0x3020, "sensor_bus", "sensor slot source bus (0xFF = unused)", U8, RW)
+        .array(16, Element::Slot)
+        .format(Format::IndexOrNone),
+    var(0x3021, "sensor_amplifier", "sensor slot source amplifier index", U8, RW).array(16, Element::Slot),
     var(0x3022, "sensor_kind", "sensor slot kind", U8, RW)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .format(Format::Enum(SENSOR_KIND)),
     var(0x3023, "sensor_offset", "sensor calibration offset", I32, RW)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .unit("milli-counts"),
     var(0x3024, "sensor_slope", "sensor calibration slope", I32, RW)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .unit("nbar/count"),
     var(0x3025, "sensor_unit_cfg", "sensor slot unit code", U8, RW)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .format(Format::Enum(UNIT_CODE)),
     var(0x3026, "sensor_constant", "sensor calibration constant term", I32, RW)
-        .array(8, Element::Slot)
+        .array(16, Element::Slot)
         .unit("mbar"),
+    var(0x3027, "sensor_pdo_channel", "tpdo sensor channel per slot (0xFF = none)", U8, RW)
+        .array(16, Element::Slot)
+        .format(Format::IndexOrNone),
+    var(0x3028, "sensor_analog_input", "ntc slot analog input", U8, RW)
+        .array(16, Element::Slot)
+        .format(Format::Enum(ANALOG_INPUT)),
     var(0x3030, "sensor_interval_ms", "sensor sample interval", U16, RW).unit("ms"),
     var(0x3031, "scan_interval_ms", "i2c presence probe interval", U16, RW).unit("ms"),
     var(0x3040, "tpdo_interval_ms", "tpdo broadcast period per kind (0 = off)", U16, RW)
-        .array(18, Element::Tpdo)
+        .array(iocan::KINDS.len() as u8, Element::Tpdo)
         .unit("ms"),
     var(0x3050, "relief_enabled", "overpressure relief enabled", U8, RW).format(Format::Enum(OFF_ON)),
     var(0x3051, "relief_valve", "overpressure relief valve index", U8, RW).format(Format::IndexOrNone),
@@ -477,6 +581,22 @@ pub const DICTIONARY: &[ObjectDef] = &[
     var(0x3065, "stepper_accel", "stepper acceleration", U32, RW)
         .array(2, Element::Actuator)
         .unit("steps/s²"),
+    var(0x3080, "valve_heating_enabled", "valve heating pad enabled", U8, RW)
+        .array(4, Element::Valve)
+        .format(Format::Enum(OFF_ON)),
+    var(0x3081, "valve_heating_hco", "valve heating outputs (bit n = HCO n+1)", U8, RW)
+        .array(4, Element::Valve)
+        .format(Format::Bits),
+    var(0x3082, "valve_heating_sensor", "valve heating sensor slot (0xFF = none)", U8, RW)
+        .array(4, Element::Valve)
+        .format(Format::IndexOrNone),
+    var(0x3083, "valve_heating_setpoint", "valve heating setpoint (slot's own unit)", I16, RW)
+        .array(4, Element::Valve)
+        .format(Format::Reading(i16::MIN as i64))
+        .unit("counts"),
+    var(0x3084, "valve_heating_hysteresis", "valve heating dead band half-width (slot's own unit)", U16, RW)
+        .array(4, Element::Valve)
+        .unit("counts"),
 ];
 
 /// The definition of an object, if the firmware has one at that index.
@@ -677,7 +797,7 @@ pub fn decode_sdo(frame: &CanFrame) -> Option<SdoTransfer> {
 /// This is the other half of [`super::iocan`]: there the frame becomes named
 /// series, here it becomes the dictionary entries the firmware documents it
 /// as a copy of (`iocan-proto/src/tpdo.rs` says which, per kind).
-fn tpdo_objects(kind: TpdoKind, data: &[u8; 8], mut emit: impl FnMut(u16, u8, i64)) {
+fn tpdo_objects(kind: TpdoKind, data: &[u8; 8], t_utc: f64, mut emit: impl FnMut(u16, u8, i64)) {
     let words = iocan::u16x4(data);
     let array = |emit: &mut dyn FnMut(u16, u8, i64), index: u16, first: u8, values: &[i64]| {
         for (i, v) in values.iter().enumerate() {
@@ -721,7 +841,7 @@ fn tpdo_objects(kind: TpdoKind, data: &[u8; 8], mut emit: impl FnMut(u16, u8, i6
             array(&mut emit, 0x2004, first, &iocan::i16x4(data).map(|v| v as i64));
         }
         TpdoKind::SensorUnits => {
-            let codes = iocan::unpack_2bit(&data[..3]);
+            let codes = iocan::unpack_sensor_units(data, t_utc);
             array(&mut emit, 0x2005, 1, &codes.map(|c| c as i64));
         }
         TpdoKind::I2cScan => {
@@ -736,6 +856,8 @@ fn tpdo_objects(kind: TpdoKind, data: &[u8; 8], mut emit: impl FnMut(u16, u8, i6
             emit(0x2031, 0, (data[1] != 0) as i64);
             emit(0x2033, 0, u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as i64);
         }
+        TpdoKind::Temperature => array(&mut emit, 0x2042, 1, &iocan::i16x4(data).map(|v| v as i64)[..2]),
+        TpdoKind::ErrorSummary => array(&mut emit, 0x2051, 1, &w),
     }
 }
 
@@ -975,7 +1097,7 @@ impl CanOpenLog {
                 let info = nodes.entry(key).or_insert_with(|| NodeInfo::new(key, frame.t_utc));
                 info.last_seen = frame.t_utc;
                 *info.tpdo_frames.entry(kind as usize).or_default() += 1;
-                tpdo_objects(kind, &frame.data, |index, sub, raw| {
+                tpdo_objects(kind, &frame.data, frame.t_utc, |index, sub, raw| {
                     log.objects
                         .entry(object_key(index, sub))
                         .or_default()
@@ -1032,12 +1154,17 @@ impl CanOpenLog {
             return raw.to_string();
         };
         let text = def.format_value(raw);
-        if key.index != 0x2004 || raw == i16::MIN as i64 {
+        if raw == i16::MIN as i64 {
             return text;
         }
-        let code = self
-            .value_at(ObjectKey { index: 0x2005, ..key }, t_utc)
-            .and_then(|v| u8::try_from(v.raw).ok());
+        let code = match key.index {
+            0x2004 => self
+                .value_at(ObjectKey { index: 0x2005, ..key }, t_utc)
+                .and_then(|v| u8::try_from(v.raw).ok()),
+            // The board temperatures are always centicelsius.
+            0x2042 => Some(iocan::UNIT_CENTI_CELSIUS),
+            _ => return text,
+        };
         match iocan::sensor_unit(code) {
             (unit, scale) if scale != 1.0 => {
                 // As many decimals as the scale has -- centibar is 0.01 bar.
@@ -1151,6 +1278,7 @@ mod tests {
         assert_eq!(def.array.map(|(len, _)| len as usize), Some(iocan::KINDS.len()));
         assert_eq!(def.sub_label(1).as_deref(), Some("ValveCommanded"));
         assert_eq!(def.sub_label(18).as_deref(), Some("ValveCurrent"));
+        assert_eq!(def.sub_label(20).as_deref(), Some("ErrorSummary"));
     }
 
     /// Real acknowledgements from the example log: the master writing valve
@@ -1300,5 +1428,26 @@ mod tests {
         assert_eq!(at(2, 93), "93 counts = 0.93 bar");
         assert_eq!(at(2, 7), "7 counts = 0.07 bar");
         assert_eq!(at(3, -32768), "no reading");
+    }
+
+    /// The board temperature and error summary TPDOs land on the objects
+    /// they mirror, `0x2042` and `0x2051`.
+    #[test]
+    fn temperature_and_error_summary_tpdos_mirror_their_objects() {
+        let mut temps = [0u8; 8];
+        temps[..2].copy_from_slice(&2345i16.to_le_bytes());
+        temps[2..4].copy_from_slice(&i16::MIN.to_le_bytes());
+        let log = CanOpenLog::build(&[
+            frame(0.0, 0x325, temps),
+            frame(0.0, 0x335, [0x03, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00]),
+        ]);
+        assert_eq!(log.format_value_at(key(5, 0x2042, 1), 2345, 1.0), "2345 centi-°C = 23.45 °C");
+        assert_eq!(log.format_value_at(key(5, 0x2042, 2), i16::MIN as i64, 1.0), "no reading");
+        assert_eq!(log.value_at(key(5, 0x2051, 1), 1.0).map(|v| v.raw), Some(3));
+        assert_eq!(log.value_at(key(5, 0x2051, 3), 1.0).map(|v| v.raw), Some(7));
+        assert_eq!(log.series_name(key(5, 0x2042, 1)), "CAN_OD[5].temperature_th1");
+        assert_eq!(log.series_name(key(5, 0x2051, 2)), "CAN_OD[5].error_summary_peripheral");
+        assert_eq!(describe_object(0x2007, 5), "0x2007.5 raw ADC counts on the COM5/COM6 pins and TH1 [TH1]");
+        assert_eq!(describe_object(0x2050, 28).split('[').nth(1), Some("sensor_missing_at_boot]"));
     }
 }

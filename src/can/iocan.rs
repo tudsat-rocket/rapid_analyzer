@@ -72,9 +72,11 @@ pub enum TpdoKind {
     RailCurrent,
     Status,
     ValveCurrent,
+    Temperature,
+    ErrorSummary,
 }
 
-pub const KINDS: [TpdoKind; 18] = [
+pub const KINDS: [TpdoKind; 20] = [
     TpdoKind::ValveCommanded,
     TpdoKind::ValveTarget,
     TpdoKind::ValveMeasured,
@@ -93,6 +95,8 @@ pub const KINDS: [TpdoKind; 18] = [
     TpdoKind::RailCurrent,
     TpdoKind::Status,
     TpdoKind::ValveCurrent,
+    TpdoKind::Temperature,
+    TpdoKind::ErrorSummary,
 ];
 
 impl TpdoKind {
@@ -120,6 +124,8 @@ impl TpdoKind {
             Self::RailCurrent => "RailCurrent",
             Self::Status => "Status",
             Self::ValveCurrent => "ValveCurrent",
+            Self::Temperature => "Temperature",
+            Self::ErrorSummary => "ErrorSummary",
         }
     }
 }
@@ -180,6 +186,8 @@ const ADC_BUS0: [&str; 8] = names!("bus0_ch", "", 0, 1, 2, 3, 4, 5, 6, 7);
 const ADC_BUS1: [&str; 8] = names!("bus1_ch", "", 0, 1, 2, 3, 4, 5, 6, 7);
 const RAIL_VOLTAGE: [&str; 3] = ["voltage_logic", "voltage_hco12", "voltage_hco34"];
 const RAIL_CURRENT: [&str; 3] = ["current_logic", "current_hco12", "current_hco34"];
+/// `iocan-proto`'s `ErrorCategory`, in sub-index order.
+pub(super) const ERROR_CATEGORY: [&str; 4] = ["general", "peripheral", "can", "reboot"];
 
 const VALVE: &str = "CAN_VALVE";
 const HCO: &str = "CAN_HCO";
@@ -189,6 +197,8 @@ const RAIL: &str = "CAN_RAIL";
 const STATUS: &str = "CAN_STATUS";
 const I2C: &str = "CAN_I2C";
 const NODE: &str = "CAN_NODE";
+const BOARD: &str = "CAN_BOARD";
+const ERRORS: &str = "CAN_ERRORS";
 
 /// Promille of full travel, the unit all three valve position layers use.
 const PROMILLE: &str = "‰";
@@ -238,7 +248,7 @@ impl Collector {
             {
                 sensor_units
                     .entry((frame.bus, node))
-                    .or_insert_with(|| unpack_2bit(&frame.data[..3]));
+                    .or_insert_with(|| unpack_sensor_units(&frame.data, frame.t_utc));
             }
         }
         Self {
@@ -399,6 +409,26 @@ impl Collector {
                 let ms = u32::from_le_bytes([frame.data[4], frame.data[5], frame.data[6], frame.data[7]]);
                 self.push(frame, STATUS, "ms_since_heartbeat", "ms", ms as f64);
             }
+            TpdoKind::Temperature => {
+                // The on-board thermistor TH1, then the MCU die sensor, in
+                // centicelsius. The die sensor is uncalibrated (about ±20 °C
+                // of fixed offset): a trend, not a reading.
+                let words = i16x4(&frame.data);
+                for (field, raw) in [("temp_th1", words[0]), ("temp_mcu", words[1])] {
+                    if raw != SENSOR_INVALID {
+                        let (unit, scale) = sensor_unit(Some(UNIT_CENTI_CELSIUS));
+                        self.push(frame, BOARD, field, unit, raw as f64 * scale);
+                    }
+                }
+            }
+            TpdoKind::ErrorSummary => {
+                // Wrapping counts of 250 ms windows in which a category's
+                // error counters rose: a step is a bad window, and the slope
+                // is the rate. "reboot" is reserved and always 0 for now.
+                for (i, count) in u16x4(&frame.data).into_iter().enumerate() {
+                    self.push(frame, ERRORS, ERROR_CATEGORY[i], "", count as f64);
+                }
+            }
         }
     }
 
@@ -440,10 +470,15 @@ pub(super) fn sensor_unit(code: Option<u8>) -> (&'static str, f64) {
     match code {
         Some(0) => ("bar", 0.01),
         Some(1) => ("bar", 0.1),
-        Some(2) => ("°C", 0.01),
+        Some(UNIT_CENTI_CELSIUS) => ("°C", 0.01),
+        Some(4) => ("‰", 1.0),
         _ => ("counts", 1.0),
     }
 }
+
+/// The unit code for centidegrees Celsius: every temperature kind's default,
+/// and what the `Temperature` frame is always in.
+pub(super) const UNIT_CENTI_CELSIUS: u8 = 2;
 
 pub(super) fn u16x4(data: &[u8; 8]) -> [u16; 4] {
     let mut out = [0u16; 4];
@@ -462,11 +497,24 @@ pub(super) fn unpack_nibbles(bytes: &[u8]) -> [u8; 4] {
     [bytes[0] & 0xF, bytes[0] >> 4, bytes[1] & 0xF, bytes[1] >> 4]
 }
 
-/// Twelve 2-bit values packed low bits first into three bytes.
-pub(super) fn unpack_2bit(bytes: &[u8]) -> [u8; PROTOCOL_SENSOR_SLOTS] {
+/// When the firmware widened `SensorUnits` from 2 to 4 bits a slot
+/// (2026-09-01, io board firmware `1807a22`), as UTC seconds.
+///
+/// The frame does not say which layout it is in, and the two overlap: `0x20`
+/// is slot 2 in centi-°C in one and slot 1 in the other. So a log is read in
+/// the layout the firmware had on the day it was recorded -- wrong for a board
+/// still running older firmware after that date, but right for every log on
+/// hand, the August example included.
+const SENSOR_UNITS_NIBBLES_SINCE: f64 = 1_788_220_800.0;
+
+/// A `SensorUnits` frame's unit code per slot.
+pub(super) fn unpack_sensor_units(data: &[u8; 8], t_utc: f64) -> [u8; PROTOCOL_SENSOR_SLOTS] {
     let mut out = [0u8; PROTOCOL_SENSOR_SLOTS];
+    let bits = if t_utc < SENSOR_UNITS_NIBBLES_SINCE { 2 } else { 4 };
+    let per_byte = 8 / bits;
+    let mask = (1u8 << bits) - 1;
     for (i, slot) in out.iter_mut().enumerate() {
-        *slot = (bytes[i / 4] >> ((i % 4) * 2)) & 0b11;
+        *slot = (data[i / per_byte] >> ((i % per_byte) * bits)) & mask;
     }
     out
 }
@@ -512,8 +560,10 @@ mod tests {
         assert_eq!(process_data(0x2E7), Some((7, TpdoKind::RailVoltage)));
         assert_eq!(process_data(0x30D), Some((13, TpdoKind::Status)));
         assert_eq!(process_data(0x31F), Some((15, TpdoKind::ValveCurrent)));
+        assert_eq!(process_data(0x326), Some((6, TpdoKind::Temperature)));
+        assert_eq!(process_data(0x33A), Some((10, TpdoKind::ErrorSummary)));
         // Past the last kind, and into the SDO range.
-        assert_eq!(process_data(0x320), None);
+        assert_eq!(process_data(0x340), None);
         assert_eq!(process_data(0x583), None);
         assert_eq!(process_data(0x1FF), None);
     }
@@ -578,6 +628,27 @@ mod tests {
         assert_eq!(unit(&frames, "CAN_SENSOR[5].slot0").as_deref(), Some("°C"));
         assert_eq!(value(&frames, "CAN_SENSOR[5].slot1"), Some(0.93));
         assert_eq!(unit(&frames, "CAN_SENSOR[5].slot1").as_deref(), Some("bar"));
+    }
+
+    /// The same frame, before and after the firmware widened the unit codes
+    /// to a nibble: `0x20` is slot 2 in centi-°C in the old layout (the
+    /// August example log's node 6) and slot 1 in the new one.
+    #[test]
+    fn sensor_units_are_read_in_the_layout_of_the_day() {
+        let at = |t_utc: f64| {
+            let mut units = frame(0x2C6, [0x20, 0, 0, 0, 0, 0, 0, 0]);
+            units.t_utc = t_utc;
+            let mut values = frame(0x296, [0x10, 0x27, 0x10, 0x27, 0x10, 0x27, 0, 0]);
+            values.t_utc = t_utc;
+            let frames = [units, values];
+            (1..=2)
+                .map(|slot| unit(&frames, &format!("CAN_SENSOR[6].slot{slot}")).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(at(SENSOR_UNITS_NIBBLES_SINCE - 1.0), ["bar", "°C"]);
+        assert_eq!(at(SENSOR_UNITS_NIBBLES_SINCE), ["°C", "bar"]);
+        // Codes past 3 only fit the new layout: slot 11 in promille.
+        assert_eq!(unpack_sensor_units(&[0, 0, 0, 0, 0, 0x40, 0, 0], SENSOR_UNITS_NIBBLES_SINCE)[11], 4);
     }
 
     #[test]
@@ -671,6 +742,33 @@ mod tests {
         assert_eq!(value(&frames, "CAN_I2C[5].present_count_bus0"), Some(3.0));
         assert_eq!(value(&frames, "CAN_I2C[5].present_count_bus1"), Some(2.0));
         assert_eq!(value(&frames, "CAN_I2C[5].sweeps"), Some(3653.0));
+    }
+
+    /// `iocan-proto`'s `TpdoFrame::Temperature`: TH1, then the die sensor,
+    /// as the first two i16 words, in centicelsius.
+    #[test]
+    fn board_temperatures_decode_in_celsius() {
+        let mut data = [0u8; 8];
+        data[..2].copy_from_slice(&2345i16.to_le_bytes());
+        data[2..4].copy_from_slice(&(-512i16).to_le_bytes());
+        let frames = [frame(0x325, data)];
+        assert_eq!(value(&frames, "CAN_BOARD[5].temp_th1"), Some(23.45));
+        assert_eq!(value(&frames, "CAN_BOARD[5].temp_mcu"), Some(-5.12));
+        assert_eq!(unit(&frames, "CAN_BOARD[5].temp_th1").as_deref(), Some("°C"));
+        // A rev2 board has neither: both words are the invalid sentinel.
+        let mut none = [0u8; 8];
+        none[..2].copy_from_slice(&i16::MIN.to_le_bytes());
+        none[2..4].copy_from_slice(&i16::MIN.to_le_bytes());
+        assert!(decode(&[frame(0x325, none)]).is_empty());
+    }
+
+    #[test]
+    fn the_error_summary_is_one_counter_per_category() {
+        let frames = [frame(0x335, [0x03, 0x00, 0x10, 0x01, 0x07, 0x00, 0x00, 0x00])];
+        assert_eq!(value(&frames, "CAN_ERRORS[5].general"), Some(3.0));
+        assert_eq!(value(&frames, "CAN_ERRORS[5].peripheral"), Some(272.0));
+        assert_eq!(value(&frames, "CAN_ERRORS[5].can"), Some(7.0));
+        assert_eq!(value(&frames, "CAN_ERRORS[5].reboot"), Some(0.0));
     }
 
     #[test]

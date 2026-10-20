@@ -249,7 +249,9 @@ would fold every node's traffic into one `CAN_FRAME.data[0]` series. `import/tlo
   a protocol change there has to be repeated here. The kind table's *order* is the wire encoding,
   so an inserted variant silently relabels everything after it; the tests pin it, along with each
   frame's field offsets, against real frames. Note `device-conf/can-io.toml`'s comment table in
-  that repo is stale — `iocan-proto/src/ids.rs` is the authority.
+  that repo is stale — `iocan-proto/src/ids.rs` is the authority. `SensorUnits` changed from
+  2 to 4 bits a slot on 2026-09-01 without a version marker, so it is decoded in the layout
+  of the day the log was recorded (`unpack_sensor_units`).
 - `can/canopen.rs` reads the same frames as the IO boards' **object dictionary**
   over time, for the inspector window (`canopen_inspector.rs`). `DICTIONARY`
   mirrors `device-conf/can-io.toml` (plus the `0x1000` objects `src/store.rs`
