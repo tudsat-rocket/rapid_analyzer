@@ -31,6 +31,9 @@ pub fn import_reader<R: Read>(reader: R, label: &str) -> Result<LogSource> {
     let mut collector = Collector::default();
     let mut ts_buf = [0u8; 8];
     let mut n_messages = 0u64;
+    let mut n_skipped = 0u64;
+    let mut n_bad_time = 0u64;
+    let mut last_good_t: Option<f64> = None;
 
     loop {
         match read_exact_from_peek(&mut reader, &mut ts_buf) {
@@ -43,17 +46,34 @@ pub fn import_reader<R: Read>(reader: R, label: &str) -> Result<LogSource> {
 
         match mavlink_core::read_versioned_msg::<MavMessage, _>(&mut reader, ReadVersion::Any) {
             Ok((header, msg)) => {
+                // Whenever mavlink-core had to resync -- a bad CRC, or a
+                // false-positive frame that swallowed the next record's
+                // timestamp -- the 8 bytes read above were not this frame's
+                // timestamp but whatever preceded the scan. The message is
+                // fine; its time is noise, and one sample in 1970 stretches
+                // the timeline across 56 years.
+                if !plausible_time(t_utc, last_good_t) {
+                    n_bad_time += 1;
+                    continue;
+                }
+                last_good_t = Some(t_utc);
                 n_messages += 1;
                 collector.push_message(&msg, header.system_id, header.component_id, t_utc);
             }
             Err(MessageReadError::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => break,
-            Err(_) => {
-                // mavlink-core already resyncs on bad CRC by rescanning for
-                // the next STX byte-by-byte, so messages outside our dialect
-                // (or genuine corruption) are silently skipped there, not
-                // surfaced here. What reaches this arm is something the
-                // resync can't recover from (e.g. the file is truncated
-                // mid-frame); stop and keep whatever was parsed so far.
+            Err(MessageReadError::Parse(_)) => {
+                // A frame whose CRC checked out but whose payload doesn't
+                // decode: an id outside our dialect that happens to pass the
+                // CRC, or an enum value the XML doesn't list. mavlink-core
+                // has already consumed the frame, so skip just this one --
+                // stopping here once silently dropped the last 3.6 h of a
+                // 6.7 h log over a single bad frame.
+                n_skipped += 1;
+            }
+            Err(e) => {
+                // A read error the resync can't get past; keep whatever was
+                // parsed so far.
+                log::warn!("{label}: stopped after {n_messages} messages: {e}");
                 break;
             }
         }
@@ -63,7 +83,7 @@ pub fn import_reader<R: Read>(reader: R, label: &str) -> Result<LogSource> {
 
     let (series, can) = collector.finish();
     log::info!(
-        "{label}: {n_messages} messages -> {} series ({} CAN frames)",
+        "{label}: {n_messages} messages -> {} series ({} CAN frames; skipped {n_skipped} undecodable frames, {n_bad_time} with a corrupt timestamp)",
         series.len(),
         can.len(),
     );
@@ -73,6 +93,17 @@ pub fn import_reader<R: Read>(reader: R, label: &str) -> Result<LogSource> {
         format: LogFormat::Tlog,
         can,
     })
+}
+
+/// Whether `t_utc` can be a real record's time: inside this century, and
+/// within a day of the last accepted record. Bytes read out of alignment
+/// essentially never land in that window, and a real log never jumps a day
+/// between two records.
+fn plausible_time(t_utc: f64, last_good: Option<f64>) -> bool {
+    const EARLIEST: f64 = 946_684_800.0; // 2000-01-01
+    const LATEST: f64 = 4_102_444_800.0; // 2100-01-01
+    const MAX_JUMP: f64 = 24.0 * 3600.0;
+    (EARLIEST..LATEST).contains(&t_utc) && last_good.is_none_or(|last| (t_utc - last).abs() <= MAX_JUMP)
 }
 
 fn read_exact_from_peek<R: Read>(reader: &mut PeekReader<R>, buf: &mut [u8; 8]) -> std::io::Result<()> {
@@ -360,6 +391,63 @@ mod tests {
             .expect("temperature series");
         assert_eq!(temp.unit.as_deref(), Some("°C"));
         assert_eq!(temp.value_at(0.0, 0.0), Some(21.44));
+    }
+
+    /// One tlog record: big-endian µs timestamp, then a MAVLink v2 frame.
+    fn record(t_us: u64, msg: &MavMessage) -> Vec<u8> {
+        let mut raw = mavlink_core::MAVLinkV2MessageRaw::new();
+        raw.serialize_message(mavlink_core::MavHeader::default(), msg);
+        let mut out = t_us.to_be_bytes().to_vec();
+        out.extend_from_slice(raw.raw_bytes());
+        out
+    }
+
+    /// 2025-10-09, in tlog microseconds.
+    const T0: u64 = 1_760_000_000_000_000;
+
+    fn heartbeat_times(bytes: &[u8]) -> Option<(f64, f64)> {
+        let log = import_reader(bytes, "test").unwrap();
+        let series = log.series.iter().find(|s| s.name == "HEARTBEAT.custom_mode").unwrap();
+        series.time_bounds().map(|(lo, hi)| (lo - T0 as f64 / 1e6, hi - T0 as f64 / 1e6))
+    }
+
+    #[test]
+    fn an_undecodable_frame_does_not_end_the_import() {
+        let heartbeat = MavMessage::HEARTBEAT(Default::default());
+        // A frame with an id outside the dialect whose CRC still checks out
+        // (unknown ids get a CRC_EXTRA of 0), so mavlink-core hands it back
+        // as a parse error rather than resyncing past it.
+        let mut bad = record(T0 + 2_000_000, &heartbeat);
+        let frame = &mut bad[8..];
+        frame[7..10].copy_from_slice(&[0xFE, 0xFF, 0xFF]);
+        let len = 10 + frame[1] as usize;
+        let crc = mavlink_core::calculate_crc(&frame[1..len], 0);
+        frame[len..len + 2].copy_from_slice(&crc.to_le_bytes());
+
+        let mut bytes = record(T0 + 1_000_000, &heartbeat);
+        bytes.extend(bad);
+        bytes.extend(record(T0 + 3_000_000, &heartbeat));
+        assert_eq!(heartbeat_times(&bytes), Some((1.0, 3.0)));
+    }
+
+    #[test]
+    fn a_corrupt_timestamp_does_not_stretch_the_timeline() {
+        let heartbeat = MavMessage::HEARTBEAT(Default::default());
+        let mut bytes = record(T0 + 1_000_000, &heartbeat);
+        // Bytes read out of alignment after a resync: 1970, and 2^56 µs.
+        bytes.extend(record(12_345, &heartbeat));
+        bytes.extend(record(1 << 56, &heartbeat));
+        bytes.extend(record(T0 + 3_000_000, &heartbeat));
+        assert_eq!(heartbeat_times(&bytes), Some((1.0, 3.0)));
+    }
+
+    #[test]
+    fn plausible_times() {
+        let t = T0 as f64 / 1e6;
+        assert!(plausible_time(t, None));
+        assert!(plausible_time(t + 3600.0, Some(t)));
+        assert!(!plausible_time(0.0, None));
+        assert!(!plausible_time(t + 2.0 * 86_400.0, Some(t)));
     }
 
     #[test]
