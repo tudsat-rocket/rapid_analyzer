@@ -62,6 +62,20 @@ impl Markers {
         self.list.clear();
     }
 
+    /// How many have ever been placed -- what numbers and colours the next.
+    pub fn placed(&self) -> u64 {
+        self.placed
+    }
+
+    /// Replaces every marker, for reopening a saved session. `placed` is
+    /// carried over so the next marker's colour is not one already on screen.
+    pub fn restore(&mut self, mut list: Vec<Marker>, placed: u64) {
+        list.sort_by(|a, b| a.time.total_cmp(&b.time));
+        let next_id = list.iter().map(|m| m.id + 1).max().unwrap_or(0);
+        self.placed = placed.max(next_id).max(list.len() as u64);
+        self.list = list;
+    }
+
     pub fn len(&self) -> usize {
         self.list.len()
     }

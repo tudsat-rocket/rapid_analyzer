@@ -14,6 +14,7 @@ pub mod model;
 pub mod n2o;
 pub mod panes;
 pub mod series;
+pub mod session;
 pub mod tank;
 pub mod timeline;
 pub mod vapor;

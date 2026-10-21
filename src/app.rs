@@ -13,6 +13,7 @@ use crate::export::dialog::{DialogContext, ExportDialog};
 use crate::import;
 use crate::model::{Project, Source, SourceId, SourceKind};
 use crate::panes::{AudioPlayerSlot, Pane, PlotAxis, PlotId, Plots, TreeBehavior};
+use crate::session::{self, Session};
 use crate::tank::Tanks;
 use crate::timeline::{self, Timeline};
 use crate::vapor::Vapors;
@@ -21,6 +22,20 @@ use crate::video_worker::VideoWorker;
 struct ImportOutcome {
     path: PathBuf,
     result: Result<(String, SourceKind), String>,
+}
+
+/// A session being reopened while the files it needs are still importing.
+/// Its graphs and markers go in once the last of them has come back (or
+/// failed to), so a graph never opens half-filled.
+struct PendingSession {
+    session: Session,
+    /// What each of `session.sources` turned out to be.
+    resolved: Vec<Option<SourceId>>,
+    /// Imports still out, by the index of the saved source they are for.
+    waiting: Vec<(usize, PathBuf)>,
+    /// Saved sources that couldn't be found or imported.
+    missing: Vec<String>,
+    label: String,
 }
 
 /// Sidebar interactions can't touch the pane tree while it is being iterated
@@ -80,10 +95,20 @@ pub struct App {
     /// Light, dark, or whatever the desktop is set to. Applied to the context
     /// every frame, since egui holds it in its own options rather than here.
     theme: egui::ThemePreference,
+    pending_session: Option<PendingSession>,
+    /// Where the session was last saved to or opened from, so Ctrl+S saves
+    /// back to it without asking.
+    #[cfg(not(target_arch = "wasm32"))]
+    session_path: Option<PathBuf>,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_files: Vec<PathBuf>) -> Self {
+        Self::with_files(initial_files)
+    }
+
+    /// Everything [`Self::new`] does that doesn't need a window.
+    fn with_files(initial_files: Vec<PathBuf>) -> Self {
         let (import_tx, import_rx) = channel();
         #[cfg(target_arch = "wasm32")]
         let (picked_tx, picked_rx) = channel();
@@ -115,6 +140,9 @@ impl App {
             canopen: None,
             export: ExportDialog::default(),
             theme: egui::ThemePreference::System,
+            pending_session: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            session_path: None,
         };
         for path in initial_files {
             app.start_import(path);
@@ -123,6 +151,10 @@ impl App {
     }
 
     fn start_import(&mut self, path: PathBuf) {
+        if session::is_session_file(&path.to_string_lossy()) {
+            self.open_session_file(path);
+            return;
+        }
         self.importing += 1;
         let tx = self.import_tx.clone();
         let import = move || {
@@ -141,6 +173,13 @@ impl App {
     /// Imports a file that arrived as its contents rather than a path.
     #[cfg(target_arch = "wasm32")]
     fn queue_bytes(&mut self, name: String, bytes: Vec<u8>) {
+        if session::is_session_file(&name) {
+            match Session::from_json(&bytes) {
+                Ok(session) => self.open_session(session, None, name),
+                Err(e) => self.status = Some(format!("Couldn't open {name}: {e:#}")),
+            }
+            return;
+        }
         self.importing += 1;
         self.status = Some(format!("Reading {name}…"));
         self.queued.push((name, bytes));
@@ -209,14 +248,39 @@ impl App {
         }
         while let Ok(outcome) = self.import_rx.try_recv() {
             self.importing = self.importing.saturating_sub(1);
-            match outcome.result {
-                Ok((name, kind)) => self.add_source(outcome.path, name, kind),
-                Err(e) => self.status = Some(format!("Import failed for {}: {e}", outcome.path.display())),
+            // An import a reopened session asked for.
+            let for_session = self
+                .pending_session
+                .as_ref()
+                .and_then(|p| p.waiting.iter().position(|(_, path)| *path == outcome.path));
+            let added = match outcome.result {
+                Ok((name, kind)) => Some(self.add_source(outcome.path, name, kind)),
+                Err(e) => {
+                    self.status = Some(format!("Import failed for {}: {e}", outcome.path.display()));
+                    None
+                }
+            };
+            if let (Some(at), Some(pending)) = (for_session, self.pending_session.as_mut()) {
+                let (index, _) = pending.waiting.remove(at);
+                let saved = &pending.session.sources[index];
+                match added {
+                    Some(id) => {
+                        pending.resolved[index] = Some(id);
+                        if let Some(source) = self.project.sources.iter_mut().find(|s| s.id == id) {
+                            source.offset_seconds = saved.offset_seconds;
+                            source.enabled = saved.enabled;
+                        }
+                    }
+                    None => pending.missing.push(saved.name.clone()),
+                }
+                if pending.waiting.is_empty() {
+                    self.finish_session();
+                }
             }
         }
     }
 
-    fn add_source(&mut self, path: PathBuf, name: String, kind: SourceKind) {
+    fn add_source(&mut self, path: PathBuf, name: String, kind: SourceKind) -> SourceId {
         let id = self.project.alloc_id();
         let idx = self.project.sources.len();
         let color = color_for_index(idx);
@@ -252,6 +316,204 @@ impl App {
             }
         }
         self.status = Some(format!("Imported {name}"));
+        id
+    }
+
+    /// The state worth keeping, as a session file's contents.
+    fn capture_session(&self) -> Session {
+        let open = self
+            .plots
+            .iter()
+            .filter(|plot| self.pane_tiles.contains_key(&Pane::Plot(plot.id)));
+        Session::capture(&self.project, open, &self.timeline)
+    }
+
+    /// Saves to the file the session came from, or asks where.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn save_session(&mut self, ask: bool) {
+        let path = match (&self.session_path, ask) {
+            (Some(path), false) => path.clone(),
+            _ => {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("rapid-analyzer session", &[session::EXTENSION])
+                    .set_file_name(session::default_file_name(&self.project));
+                if let Some(dir) = self.session_path.as_ref().and_then(|p| p.parent()) {
+                    dialog = dialog.set_directory(dir);
+                } else if let Some(dir) = self.project.sources.first().and_then(|s| s.path.parent()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                let Some(path) = dialog.save_file() else {
+                    return;
+                };
+                // A dialog filtering on an extension does not always add it.
+                if session::is_session_file(&path.to_string_lossy()) {
+                    path
+                } else {
+                    path.with_extension(session::EXTENSION)
+                }
+            }
+        };
+        let result = self
+            .capture_session()
+            .to_json()
+            .and_then(|bytes| Ok(std::fs::write(&path, bytes)?));
+        self.status = Some(match result {
+            Ok(()) => {
+                let status = format!("Saved session to {}", path.display());
+                self.session_path = Some(path);
+                status
+            }
+            Err(e) => format!("Couldn't save the session: {e:#}"),
+        });
+    }
+
+    /// There is nowhere to write to in the browser: the session is a download.
+    #[cfg(target_arch = "wasm32")]
+    fn save_session(&mut self, _ask: bool) {
+        let name = session::default_file_name(&self.project);
+        let result = self
+            .capture_session()
+            .to_json()
+            .and_then(|bytes| crate::web::download(&name, &bytes, "application/json"));
+        self.status = Some(match result {
+            Ok(()) => format!("Downloaded {name}"),
+            Err(e) => format!("Couldn't save the session: {e:#}"),
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pick_session(&mut self, _ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new().add_filter("rapid-analyzer session", &[session::EXTENSION]);
+        if let Some(dir) = self.session_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_session_file(path);
+        }
+    }
+
+    /// Picked like any other file; `queue_bytes` sees the extension.
+    #[cfg(target_arch = "wasm32")]
+    fn pick_session(&mut self, ctx: &egui::Context) {
+        self.pick_file(ctx);
+    }
+
+    fn open_session_file(&mut self, path: PathBuf) {
+        let read = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| Session::from_json(&b));
+        match read {
+            Ok(session) => {
+                let label = path.display().to_string();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.session_path = Some(path.clone());
+                }
+                self.open_session(session, Some(&path), label);
+            }
+            Err(e) => self.status = Some(format!("Couldn't open {}: {e:#}", path.display())),
+        }
+    }
+
+    /// Reopens a saved session: finds or imports its files, then -- once
+    /// they are all in -- replaces the graphs and markers with the saved ones.
+    /// Sources already loaded stay loaded.
+    fn open_session(&mut self, session: Session, session_path: Option<&std::path::Path>, label: String) {
+        let mut resolved = vec![None; session.sources.len()];
+        // Only ever pushed to where there are paths to import from.
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+        let mut waiting = Vec::new();
+        let mut missing = Vec::new();
+        for (i, saved) in session.sources.iter().enumerate() {
+            if let Some(id) = session::find_loaded(saved, &self.project.sources) {
+                resolved[i] = Some(id);
+                if let Some(source) = self.project.sources.iter_mut().find(|s| s.id == id) {
+                    source.offset_seconds = saved.offset_seconds;
+                    source.enabled = saved.enabled;
+                }
+                continue;
+            }
+            // A browser can't open a path; the file has to be imported first.
+            #[cfg(not(target_arch = "wasm32"))]
+            if let Some(path) = session::candidate_paths(saved, session_path)
+                .into_iter()
+                .find(|p| p.is_file())
+            {
+                // Two saved sources can't be one file, but a file can be
+                // listed twice in a hand-edited session.
+                if !waiting.iter().any(|(_, p)| *p == path) {
+                    waiting.push((i, path.clone()));
+                    self.start_import(path);
+                }
+                continue;
+            }
+            let _ = session_path;
+            missing.push(saved.name.clone());
+        }
+        let done = waiting.is_empty();
+        self.pending_session = Some(PendingSession {
+            session,
+            resolved,
+            waiting,
+            missing,
+            label,
+        });
+        if done {
+            self.finish_session();
+        } else {
+            self.status = Some("Opening session: importing its files…".to_string());
+        }
+    }
+
+    fn finish_session(&mut self) {
+        let Some(pending) = self.pending_session.take() else {
+            return;
+        };
+        let session = &pending.session;
+
+        let open: Vec<PlotId> = self.plots.iter().map(|p| p.id).collect();
+        for id in open {
+            self.remove_pane(&Pane::Plot(id));
+        }
+        let mut missing_entries = 0;
+        let mut opened = 0;
+        for plot in &session.plots {
+            let (entries, missing) = session.restored_entries(plot, &self.project, &pending.resolved);
+            missing_entries += missing;
+            if entries.is_empty() {
+                continue;
+            }
+            let id = self.plots.restore(
+                entries,
+                plot.title.clone(),
+                plot.normalize,
+                plot.zero_aligned,
+                plot.y_manual,
+            );
+            self.add_pane(Pane::Plot(id));
+            opened += 1;
+        }
+
+        self.timeline
+            .markers
+            .restore(session.restored_markers(), session.markers_placed);
+        if let Some(view) = session.view {
+            self.timeline.set_view(view.start, view.end);
+            self.timeline.seek(view.cursor, self.project.time_bounds());
+        }
+
+        let mut status = format!(
+            "Opened {}: {opened} graph{}, {} marker{}",
+            pending.label,
+            if opened == 1 { "" } else { "s" },
+            self.timeline.markers.len(),
+            if self.timeline.markers.len() == 1 { "" } else { "s" },
+        );
+        if !pending.missing.is_empty() {
+            status += &format!(" -- not found: {}", pending.missing.join(", "));
+        }
+        if missing_entries > 0 {
+            status += &format!(" -- {missing_entries} series could not be placed");
+        }
+        self.status = Some(status);
     }
 
     fn add_pane(&mut self, pane: Pane) {
@@ -533,8 +795,20 @@ impl App {
         {
             new_tank_pane = true;
         }
+        let mut save_session = false;
+        let mut open_session = false;
+        ui.horizontal(|ui| {
+            save_session = ui
+                .button("💾 Save session…")
+                .on_hover_text("Save the open graphs, the markers and the files behind them  (Ctrl+S)")
+                .clicked();
+            open_session = ui
+                .button("📂 Open session…")
+                .on_hover_text("Reopen a saved session, importing any of its files that aren't loaded  (Ctrl+O)")
+                .clicked();
+        });
         if ui
-            .button("💾 Export graph…")
+            .button("🖼 Export graph…")
             .on_hover_text("Save the graphs you have open as an SVG or PNG, for a report  (Ctrl+E)")
             .clicked()
         {
@@ -558,6 +832,12 @@ impl App {
         }
         if open_export {
             self.open_export();
+        }
+        if save_session {
+            self.save_session(true);
+        }
+        if open_session {
+            self.pick_session(ui.ctx());
         }
         if self.project.sources.is_empty() {
             ui.weak(IMPORT_HINT);
@@ -677,6 +957,8 @@ impl App {
         }
         let bounds = self.project.time_bounds();
         let mut open_export = false;
+        let mut save_session = false;
+        let mut open_session = false;
         ctx.input(|i| {
             // Shift for a coarse step, Alt for a fine one: the same gesture
             // at three scales rather than three keys.
@@ -701,7 +983,15 @@ impl App {
                 // Held arrows should scrub; a held toggle should not flicker.
                 let toggle = matches!(
                     key,
-                    egui::Key::Space | egui::Key::B | egui::Key::R | egui::Key::M | egui::Key::D | egui::Key::Escape
+                    egui::Key::Space
+                        | egui::Key::B
+                        | egui::Key::R
+                        | egui::Key::M
+                        | egui::Key::D
+                        | egui::Key::Escape
+                        | egui::Key::E
+                        | egui::Key::S
+                        | egui::Key::O
                 );
                 if *repeat && toggle {
                     continue;
@@ -737,12 +1027,22 @@ impl App {
                     }
                     egui::Key::Escape => self.timeline.measure.set_active(false),
                     egui::Key::E if modifiers.command => open_export = true,
+                    egui::Key::S if modifiers.command => save_session = true,
+                    egui::Key::O if modifiers.command => open_session = true,
                     _ => {}
                 }
             }
         });
         if open_export {
             self.open_export();
+        }
+        if save_session {
+            // Ctrl+Shift+S always asks, as "save as" does everywhere else.
+            let ask = ctx.input(|i| i.modifiers.shift);
+            self.save_session(ask);
+        }
+        if open_session {
+            self.pick_session(ctx);
         }
     }
 }
@@ -1043,6 +1343,132 @@ mod tests {
                 can: Default::default(),
             }),
         }
+    }
+
+    fn app_with_log(name: &str, series: &[&str]) -> (App, SourceId) {
+        let mut app = App::with_files(Vec::new());
+        let kind = SourceKind::Log(LogSource {
+            series: series
+                .iter()
+                .map(|n| crate::series::TimeSeries::from_points(n.to_string(), vec![[100.0, 1.0], [200.0, 2.0]]))
+                .collect(),
+            format: LogFormat::Tlog,
+            can: Default::default(),
+        });
+        let id = app.add_source(PathBuf::from("/runs").join(name), name.to_string(), kind);
+        (app, id)
+    }
+
+    fn wait_for_imports(app: &mut App) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while app.importing > 0 || app.pending_session.is_some() {
+            assert!(Instant::now() < deadline, "imports never finished");
+            app.poll_imports();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Save, then reopen in a fresh app that already has the file loaded:
+    /// the graphs come back as panes, with their contents, and so do the
+    /// markers and the window.
+    #[test]
+    fn a_saved_session_reopens_its_graphs_and_markers() {
+        let dir = std::env::temp_dir().join(format!("rapid-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("run.session.json");
+
+        let (mut app, id) = app_with_log("a.tlog", &["P.p", "P.t"]);
+        app.apply(PendingAction::NewPlot(id, "P.p".into()));
+        let plot = app.plots.iter().next().unwrap().id;
+        app.apply(PendingAction::AddToPlot(plot, id, "P.t".into(), PlotAxis::Right));
+        app.apply(PendingAction::NewPlot(id, "P.t".into()));
+        app.project.sources[0].offset_seconds = 1.5;
+        app.timeline.cursor = 150.0;
+        app.timeline.add_marker();
+        app.timeline.markers.iter_mut().next().unwrap().name = "ignition".into();
+        app.timeline.set_view(120.0, 180.0);
+        app.session_path = Some(file.clone());
+        app.save_session(false);
+        assert!(app.status.as_deref().unwrap().starts_with("Saved"), "{:?}", app.status);
+
+        let (mut later, _) = app_with_log("a.tlog", &["P.p", "P.t"]);
+        later.apply(PendingAction::NewPlot(0, "P.p".into()));
+        later.start_import(file.clone());
+        wait_for_imports(&mut later);
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The graph that was open before the session is replaced, not kept.
+        let plots: Vec<_> = later.plots.iter().collect();
+        assert_eq!(plots.len(), 2);
+        assert_eq!(plots[0].entries.len(), 2);
+        assert_eq!(plots[0].entries[1].axis, PlotAxis::Right);
+        assert!(plots.iter().all(|p| later.pane_tiles.contains_key(&Pane::Plot(p.id))));
+        assert_eq!(later.pane_tiles.len(), 2);
+        assert_eq!(later.project.sources[0].offset_seconds, 1.5);
+        let markers = later.timeline.markers.as_slice();
+        assert_eq!((markers.len(), markers[0].time, markers[0].name.as_str()), (1, 150.0, "ignition"));
+        assert_eq!((later.timeline.view_start, later.timeline.view_end), (120.0, 180.0));
+        assert!(later.status.as_deref().unwrap().contains("2 graphs, 1 marker"), "{:?}", later.status);
+    }
+
+    /// A file the session needs that isn't loaded is imported; one that then
+    /// fails to import is reported rather than leaving the session hanging.
+    #[test]
+    fn a_session_whose_file_fails_to_import_still_opens() {
+        let dir = std::env::temp_dir().join(format!("rapid-session-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = dir.join("broken.tlog");
+        std::fs::write(&broken, b"not a log").unwrap();
+        let session = Session {
+            version: session::VERSION,
+            sources: vec![
+                session::SavedSource {
+                    name: "broken.tlog".into(),
+                    path: broken.clone(),
+                    offset_seconds: 0.0,
+                    enabled: true,
+                },
+                session::SavedSource {
+                    name: "gone.tlog".into(),
+                    path: dir.join("gone.tlog"),
+                    offset_seconds: 0.0,
+                    enabled: true,
+                },
+            ],
+            plots: vec![session::SavedPlot {
+                title: String::new(),
+                normalize: false,
+                zero_aligned: false,
+                y_manual: None,
+                entries: vec![session::SavedEntry {
+                    source: 0,
+                    series: "P.p".into(),
+                    color: [255, 0, 0, 255],
+                    axis: session::SavedAxis::Left,
+                    value_offset: 0.0,
+                }],
+            }],
+            markers: vec![session::SavedMarker {
+                time: 5.0,
+                name: "M1".into(),
+                color: [255, 0, 0, 255],
+            }],
+            markers_placed: 1,
+            view: None,
+        };
+        let file = dir.join("s.json");
+        std::fs::write(&file, session.to_json().unwrap()).unwrap();
+
+        let mut app = App::with_files(Vec::new());
+        app.start_import(file);
+        wait_for_imports(&mut app);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(app.plots.iter().count(), 0);
+        assert_eq!(app.timeline.markers.len(), 1);
+        let status = app.status.unwrap();
+        assert!(status.contains("broken.tlog") && status.contains("gone.tlog"), "{status}");
+        assert!(status.contains("1 series could not be placed"), "{status}");
     }
 
     /// Lays out one source header inside a panel `width` wide, and reports the

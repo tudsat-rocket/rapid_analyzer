@@ -180,6 +180,12 @@ impl PlotSpec {
     pub fn contains(&self, source: SourceId, series: &str) -> bool {
         self.entries.iter().any(|e| e.source == source && e.series == series)
     }
+
+    /// The name the user gave it, or empty while the title follows the
+    /// contents.
+    pub fn custom_title(&self) -> &str {
+        &self.custom_title
+    }
 }
 
 /// Every graph the user has opened, and the only place plot ids are minted.
@@ -216,6 +222,29 @@ impl Plots {
             color_cursor: 0,
         });
         self.add(id, source, series, PlotAxis::Left);
+        id
+    }
+
+    /// Opens a graph exactly as it was saved -- see [`crate::session`].
+    pub fn restore(
+        &mut self,
+        entries: Vec<PlotEntry>,
+        custom_title: String,
+        normalize: bool,
+        zero_aligned: bool,
+        y_manual: Option<(f64, f64)>,
+    ) -> PlotId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.list.push(PlotSpec {
+            id,
+            color_cursor: entries.len(),
+            entries,
+            custom_title,
+            normalize,
+            y_manual,
+            zero_aligned,
+        });
         id
     }
 

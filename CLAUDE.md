@@ -176,6 +176,20 @@ and are therefore pinned by tests:
 Being a painter rather than an `egui_plot`, it gets no gestures for free: `interact`
 writes pan/zoom/seek back into `Timeline` itself.
 
+### Sessions
+
+`src/session.rs` is the save file: JSON via serde, holding *references* --
+sources by path and name, graphs as entries pointing at an index into the
+file's own source list (a `SourceId` is per run), markers, the window. It is
+the one serde model in the crate; the live types stay serde-free and are
+converted in `Session::capture` / `restored_entries` / `restored_markers`.
+`App::open_session` matches sources (`find_loaded`: path, then name) and
+imports the rest; the graphs and markers go in only in `finish_session`, once
+`PendingSession::waiting` is empty, which `poll_imports` drives -- a failed
+import has to count as done or the session never finishes. Adding a field:
+give it `#[serde(default)]` so older files still read, and bump
+`session::VERSION` only when an older build would misread a newer file.
+
 ### Exporting a figure
 
 `src/export/` writes the open graphs as an SVG or a PNG for a report. It is

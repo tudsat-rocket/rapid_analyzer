@@ -59,7 +59,13 @@ zoomed together.
   height up the screen, temperature as colour, time across -- so
   stratification is a picture rather than ten graphs to compare by eye. See
   "Tank level" below.
-- **Export a figure**: "💾 Export graph…" (or `Ctrl+E`) opens a window that
+- **Sessions**: "💾 Save session…" (or `Ctrl+S`) writes the open graphs, the
+  markers, the visible window and the files behind them -- with their time
+  offsets -- to a small `.json` file. "📂 Open session…" (or `Ctrl+O`, or
+  dropping the file onto the window) brings them back, importing any of the
+  files that aren't loaded yet; a file that has moved is looked for beside the
+  session file. See "Sessions" below.
+- **Export a figure**: "🖼 Export graph…" (or `Ctrl+E`) opens a window that
   writes the graphs and tank panes you have open as an **SVG or PNG** for a
   report -- pick which of them to include, the time window, the size on the
   page, the resolution, the padding and the rest, with a live preview of the
@@ -249,13 +255,33 @@ more sources afterward.
 | `M` | place a marker on the playhead |
 | `D` | measuring tool on / off (`Esc` also leaves it) |
 | `Ctrl+E` | export the open graphs as a figure |
+| `Ctrl+S` | save the session (to the file it came from; `Ctrl+Shift+S` asks) |
+| `Ctrl+O` | open a saved session |
 
 Shortcuts are ignored while a text field (the series filter, a graph title)
 has focus.
 
+## Sessions
+
+A session file records *what you were looking at*, not the data: each loaded
+file's path, name, time offset and on/off state; every open graph with its
+series, colours, axes, calibration offsets, title, normalize / zero-align
+settings and a box-zoomed value range; the markers with their names and
+colours; and the visible window and playhead.
+
+Opening one keeps whatever is already loaded and matches the session's files
+against it -- same path, or failing that same file name -- importing the rest
+from where they were, or from beside the session file. Once they are in, the
+saved graphs and markers *replace* the ones on screen. A file that cannot be
+found, or a series it no longer has, is named in the status line and left out.
+
+In the browser there are no paths: saving downloads the file, and opening one
+matches its files by name against those already loaded, so load the data
+first.
+
 ## Exporting a figure
 
-"💾 Export graph…" in the sidebar (or `Ctrl+E`) opens a window that turns the
+"🖼 Export graph…" in the sidebar (or `Ctrl+E`) opens a window that turns the
 graphs you have open into a picture for a written report. It is not a
 screenshot: the series are laid out again at the size and resolution you ask
 for, on a white page by default, without the sidebar and the tab bar.
@@ -551,8 +577,7 @@ from a real log.
 - A calibration offset is per graph and per series, which is what makes it
   possible to put the raw and the corrected line side by side -- but it also
   means correcting a sensor in three graphs is three corrections. It does not
-  reach the N₂O phase or tank panes, which pick their own series, and it is
-  not saved: nothing in the app is.
+  reach the N₂O phase or tank panes, which pick their own series.
 - The export covers graph and tank panes -- the two that are drawn against the
   master timeline. The video pane is not offered (it is a frame you already
   have a file of), nor is the N₂O phase pane, whose axes are a temperature and
@@ -565,8 +590,11 @@ from a real log.
 - A PNG is composited in memory before it is written, so the exporter refuses
   a figure over about 30 megapixels (a 200 × 150 mm figure at 600 dpi) rather
   than trying. An SVG has no such limit.
-- The theme (and the export settings) last for the session; nothing in the app
-  is saved between runs.
+- A session holds graphs, markers, the window and the files' offsets. It does
+  not hold the pane layout (graphs reopen tiled in a grid), the N₂O phase and
+  tank panes, the measuring tool, the theme or the export settings, nor series
+  made with the CAN signal picker or the CANopen inspector -- a graph showing
+  one of those reopens without it.
 - The tank pane assumes the sensors are evenly spaced up the wall and that the
   number in the series name is the height. A row wired in some other order has
   to be pointed at each height by hand. It draws ten heights and no more; a
